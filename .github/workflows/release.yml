@@ -1,0 +1,32 @@
+name: macOS release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test and build Typo
+        run: |
+          ./Scripts/test.sh
+          ./Scripts/build-app.sh
+      - name: Package and publish Typo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)"
+          tag="v$version"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "$tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match app version $version"
+            exit 1
+          fi
+          archive="dist/Typo-$version-macOS-$(uname -m).zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/Typo.app "$archive"
+          unzip -tq "$archive"
+          gh release create "$tag" "$archive" --target "$GITHUB_SHA" --title "Typo $version" --generate-notes
