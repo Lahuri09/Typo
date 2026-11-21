@@ -1,0 +1,8 @@
+English and Russian word-frequency lists adapted from FrequencyWords by Hermit Dave.
+https://github.com/hermitdave/FrequencyWords/tree/525f9b560de45753a5ea01069454e72e9aa541c6/content/2018
+Source corpus: OpenSubtitles 2018 (https://opus.nlpl.eu/OpenSubtitles-v2018.php).
+License for the original and adapted lists: Creative Commons Attribution-ShareAlike 4.0 International.
+https://creativecommons.org/licenses/by-sa/4.0/
+
+Adaptation: normalized case, restricted each list to its native alphabet and 3–40 letters,
+kept words attested at least 25 times, deduplicated, and sorted alphabetically.
