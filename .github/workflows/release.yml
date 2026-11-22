@@ -15,7 +15,7 @@ jobs:
       - name: Test and build Typo
         run: |
           ./Scripts/test.sh
-          ./Scripts/build-app.sh
+          TYPO_BUNDLE_LOCAL_AI=1 ./Scripts/build-app.sh
       - name: Package and publish Typo
         env:
           GH_TOKEN: ${{ github.token }}

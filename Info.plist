@@ -3,21 +3,30 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>Typo</string>
+	<string>Typo AI</string>
 	<key>CFBundleExecutable</key>
 	<string>Typo</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.typo.Switcher</string>
 	<key>CFBundleName</key>
-	<string>Typo</string>
+	<string>Typo AI</string>
+	<key>CFBundleIconFile</key>
+	<string>TypoAI</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.16</string>
+	<string>3.0.3</string>
 	<key>CFBundleVersion</key>
-	<string>17</string>
+	<string>36</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Typo использует микрофон для диктовки по вашей команде.</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>

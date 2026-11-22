@@ -28,6 +28,11 @@ public struct LayoutLexicon: Sendable {
         count(word, in: layout) != nil
     }
 
+    public func supportsSpellingChange(from word: String, to correction: String, in layout: Layout) -> Bool {
+        guard let originalCount = count(word.lowercased(), in: layout) else { return true }
+        return (count(correction.lowercased(), in: layout) ?? 0) / 20 >= originalCount
+    }
+
     func hasCommonContinuation(of prefix: String, in layout: Layout) -> Bool {
         let words = layout == .english ? englishCommon : russianCommon
         var low = 0

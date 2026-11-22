@@ -14,7 +14,7 @@ import TypoCore
 
 @main
 struct TestRunner {
-    static func main() {
+    static func main() throws {
         convertsCaseAndPunctuation()
         automaticChecksBothLanguages()
         findsWordAtUTF16Caret()
@@ -29,7 +29,84 @@ struct TestRunner {
         recognizesWhileTyping()
         recognizesAfterPunctuation()
         learnsWordExceptions()
-        print("Passed \(checked) assertions in 11 scenarios")
+        let header = Data([82, 73, 70, 70, 0, 0, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32,
+                           16, 0, 0, 0, 1, 0, 1, 0, 128, 62, 0, 0, 0, 125, 0, 0, 2, 0, 16, 0,
+                           100, 97, 116, 97, 0, 0, 0, 0])
+        let snapshot = WaveSnapshot.make(header + Data(repeating: 0, count: 64_000), maxAudioBytes: 32_000)
+        expect(snapshot?.count == 32_044)
+        expect(snapshot.map { Array($0[40..<44]) } == [0, 125, 0, 0])
+        expect(WaveSnapshot.make(header) == nil)
+        let caret = NSRange(location: 7, length: 0)
+        let draftRange = NSRange(location: 2, length: 5)
+        expect(DictationDraft.ownedRange(in: "A Так.  B\n", selection: caret,
+                                        original: "A  B", cursor: 2, draft: "Так. ") == draftRange)
+        expect(DictationDraft.ownedRange(in: "A Так.  B", selection: draftRange,
+                                        original: "A  B", cursor: 2, draft: "Так. ") == draftRange)
+        expect(DictationDraft.ownedRange(in: "A Так.  X", selection: caret,
+                                        original: "A  B", cursor: 2, draft: "Так. ") == nil)
+        expect(DictationDraft.ownedRange(in: "A Так.  B", selection: NSRange(location: 0, length: 0),
+                                        original: "A  B", cursor: 2, draft: "Так. ") == nil)
+        let composerCaret = NSRange(location: 5, length: 0)
+        expect(DictationDraft.ownedRange(in: "Привет", selection: composerCaret,
+                                        original: "\n", cursor: 0, draft: "Привет",
+                                        allowsMissingTerminalLineFeed: true) == nil)
+        expect(DictationDraft.ownedRange(in: "Привет", selection: NSRange(location: 6, length: 0),
+                                        original: "\n", cursor: 0, draft: "Привет",
+                                        allowsMissingTerminalLineFeed: true) == NSRange(location: 0, length: 6))
+        expect(!DictationDraft.matches("Привет", expected: "Привет\n\n", allowsMissingTerminalLineFeed: true))
+        expect(DictationDraft.ownedRange(in: "До привет после", selection: NSRange(location: 9, length: 0),
+                                        original: "До пример после", cursor: 3, draft: "привет",
+                                        replacing: 6) == NSRange(location: 3, length: 6))
+        let update = DictationDraft.change(from: "Привет 👋!", to: "Привет 👋 всем", at: 2)
+        expect(update.range == NSRange(location: 11, length: 1) && update.text == " всем")
+        try buildsAIRequestsAndDecodesResponses()
+        try runCloudEditorChecks { expect($0) }
+        try runSpeechModelChecks { expect($0) }
+        runEditActionChecks { expect($0) }
+        let panelBounds = CGRect(x: -900, y: 28, width: 800, height: 620)
+        let panelSize = CGSize(width: 300, height: 84)
+        let position = PanelPosition(horizontal: 0.25, vertical: 0.75)
+        let panelFrame = position.windowFrame(size: panelSize, in: panelBounds)
+        expect(panelFrame == CGRect(x: -775, y: 162, width: 300, height: 84))
+        expect(PanelPosition(center: CGPoint(x: panelFrame.midX, y: panelFrame.midY),
+                             size: panelSize, in: panelBounds) == position)
+        let clamped = PanelPosition(center: CGPoint(x: -1_000, y: 1_000), size: panelSize, in: panelBounds)
+        expect(clamped == PanelPosition(horizontal: 0, vertical: 0))
+        let obstacle = CGRect(x: -525, y: 172, width: 75, height: 50)
+        let clear = position.windowFrame(size: panelSize, in: panelBounds, avoiding: obstacle)
+        expect(clear == CGRect(x: -829, y: 162, width: 300, height: 84))
+        let wide = position.windowFrame(size: CGSize(width: 900, height: 900), in: panelBounds,
+                                        avoiding: CGRect(x: -225, y: 28, width: 125, height: 100))
+        expect(wide == CGRect(x: -900, y: 132, width: 800, height: 516))
+        expect(EditPreset.chooserActions.prefix(2).elementsEqual([.proofread, .concise]))
+        expect(!EditPreset.chooserActions.contains(.punctuation) && !EditPreset.chooserActions.contains(.spelling))
+        expect(EditPreset.punctuation.accepts("Привет, как дела?", replacing: "Привет как дела"))
+        expect(!EditPreset.punctuation.accepts("Привет, как дела?", replacing: "Привет как поживаешь"))
+        expect(!EditPreset.punctuation.accepts("Привет, как дела?", replacing: "Привет\nкак дела"))
+        expect(EditPreset.spelling.accepts("Я сегодня дома.", replacing: "Я севодня дома."))
+        expect(!EditPreset.spelling.accepts("Я сегодня дома!", replacing: "Я севодня дома."))
+        expect(!EditPreset.spelling.accepts("Я дома.", replacing: "Я севодня дома."))
+        expect(!EditPreset.spelling.accepts("Я сижу дома.", replacing: "Я севодня дома."))
+        expect(!EditPreset.business.accepts("Send the report.", replacing: "Пришли отчёт."))
+        expect(!EditPreset.business.accepts("Отчёт, блядь, нужен к 16:00.", replacing: "Скинь отчёт к 16:00."))
+        expect(!EditPreset.business.accepts("Я заебался переделывать отчёт.", replacing: "Я устал переделывать отчёт."))
+        expect(!EditPreset.business.accepts("Fix the fucking form.", replacing: "Fix the form."))
+        expect(EditPreset.business.accepts("Подстрахуй меня и отправь отчёт.", replacing: "Помоги отправить отчёт."))
+        expect(!EditPreset.concise.accepts("Отчёт до 17:00.", replacing: "Отправь отчёт до 14:00."))
+        expect(EditPreset.concise.removingFiller(from: "Короче, я просто хотел сказать, что отчёт нужен завтра.")
+               == "Отчёт нужен завтра.")
+        expect(EditPreset.concise.removingFiller(from: "Я хотел предупредить, что отчёт нужен завтра.")
+               == "Я хотел предупредить, что отчёт нужен завтра.")
+        expect(EditPreset.proofread.fixingBasicPunctuation(in: "мы получили письмо но не ответили")
+               == "мы получили письмо, но не ответили")
+        expect(EditPreset.custom.accepts("Send the report.", replacing: "Пришли отчёт."))
+        expect(EditPreset.custom.instruction(custom: "Моя инструкция") == "Моя инструкция")
+        expect(AIRequest.cleanTranscript("  [BLANK_AUDIO]\n") == "")
+        expect(AIRequest.cleanTranscript("[blank_audio] ...") == "")
+        expect(AIRequest.cleanTranscript("Привет [BLANK_AUDIO] мир!") == "Привет мир!")
+        expect(AIRequest.cleanTranscript("Hello, world!") == "Hello, world!")
+        expect(AIRequest.cleanTranscript("Первая часть.\nВторая строка\nи конец.") == "Первая часть. Вторая строка и конец.")
+        print("Passed \(checked) assertions in 12 scenarios")
     }
 }
 
@@ -179,4 +256,30 @@ struct TestRunner {
     exceptions.remove(typed)
     exceptions.recordReversal(of: typed)
     expect(!exceptions.contains(typed))
+}
+
+@MainActor private func buildsAIRequestsAndDecodesResponses() throws {
+    let text = "Привет! 🙂"
+    let endpoint = URL(string: "http://127.0.0.1:11439")!
+    let rewrite = try AIRequest.rewrite(text, instruction: "Перепиши короче", endpoint: endpoint)
+    let body = try JSONSerialization.jsonObject(with: rewrite.httpBody!) as? [String: Any]
+    let messages = body?["messages"] as? [[String: String]]
+    expect(rewrite.url?.absoluteString == "http://127.0.0.1:11439/api/chat")
+    expect(rewrite.httpMethod == "POST")
+    expect(rewrite.value(forHTTPHeaderField: "Authorization") == nil)
+    expect(body?["model"] as? String == AIRequest.model)
+    expect(body?["stream"] as? Bool == false)
+    expect(messages?.first?["content"]?.contains("Перепиши короче") == true)
+    expect((body?["format"] as? [String: Any])?["required"] as? [String] == ["edited"])
+    expect(body?["think"] as? Bool == false)
+    let input = try JSONDecoder().decode([String: String].self, from: Data((messages?.last?["content"] ?? "").utf8))
+    expect(input["source"] == text)
+    expect(AIRequest.isConversationalRefusal("Я не могу продолжить разговор.", source: "Сократи меня."))
+    expect(!AIRequest.isConversationalRefusal("Я не могу прийти.", source: "Я не могу прийти сегодня."))
+    expect(!EditPreset.concise.accepts("Привет, как у тебя дела?", replacing: "Привет, как дела?"))
+
+    let rewritten = try AIRequest.result(from: Data(#"{"message":{"content":"{\"edited\":\"  Исправлено  \"}"}}"#.utf8))
+    let empty = try AIRequest.result(from: Data(#"{"message":{"content":"{\"edited\":\"   \"}"}}"#.utf8))
+    expect(rewritten == "Исправлено")
+    expect(empty.isEmpty)
 }

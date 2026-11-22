@@ -5,14 +5,32 @@ import OSLog
 import TypoCore
 
 enum Action: String, CaseIterable, Identifiable {
-    case correct, undo
+    case correct, undo, dictation, rewrite
     var id: Self { self }
-    var title: String { self == .correct ? "Исправить выделение или слово" : "Отменить исправление" }
-    var initial: Shortcut { Shortcut(key: self == .correct ? 97 : 98, modifiers: 0) }
+    var title: String {
+        switch self {
+        case .correct: "Исправить выделение или слово"
+        case .undo: "Отменить исправление"
+        case .dictation: "Начать или закончить диктовку"
+        case .rewrite: "Обработать выделенный текст"
+        }
+    }
+
+    var initial: Shortcut {
+        let aiModifiers: CGEventFlags = [.maskControl, .maskAlternate, .maskCommand]
+        return switch self {
+        case .correct: Shortcut(key: UInt16(kVK_F6), modifiers: 0)
+        case .undo: Shortcut(key: UInt16(kVK_F7), modifiers: 0)
+        case .dictation: Shortcut(key: UInt16(kVK_ANSI_D), modifiers: aiModifiers.rawValue)
+        case .rewrite: Shortcut(key: UInt16(kVK_ANSI_R), modifiers: CGEventFlags.maskControl.rawValue)
+        }
+    }
 }
 
 @Observable
 final class InputEngine {
+    let ai = AIInput()
+    private var lastExternalApplication: NSRunningApplication?
     static let modifiers: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
     static let functionKeys: [UInt16: Int] = [
         122: 1, 120: 2, 99: 3, 118: 4, 96: 5, 97: 6, 98: 7, 100: 8, 101: 9, 109: 10,
@@ -51,6 +69,10 @@ final class InputEngine {
 
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
+    @ObservationIgnored private var pendingContextCheck = false
+    @ObservationIgnored private var watchesPanelMode = false
+    @ObservationIgnored private var contextObserver: AXObserver?
+    @ObservationIgnored private var contextPID: pid_t?
     private var matcher = HotkeyMatcher()
     private var typedLetters = 0
     private var inputRevision: UInt64 = 0
@@ -77,12 +99,18 @@ final class InputEngine {
     }
 
     func start(prompt: Bool = false) {
+        if !watchesPanelMode {
+            watchesPanelMode = true
+            watchPanelMode()
+        }
         if prompt {
             trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
         } else {
             trusted = AXIsProcessTrusted()
         }
         if !trusted {
+            ai.panelAppearance.setTextContext(false)
+            observeContext(of: nil)
             if let tap { CFMachPortInvalidate(tap) }
             tap = nil
             source = nil
@@ -96,12 +124,15 @@ final class InputEngine {
             return
         }
 
-        let types: [CGEventType] = [.keyDown, .keyUp, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        let types: [CGEventType] = [.keyDown, .keyUp, .leftMouseDown, .leftMouseUp, .rightMouseDown, .otherMouseDown]
         let mask = types.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
             eventsOfInterest: mask, callback: { proxy, type, event, pointer in
                 guard let pointer else { return Unmanaged.passUnretained(event) }
+                if event.getIntegerValueField(.eventSourceUserData) == dictationEventMarker {
+                    return Unmanaged.passUnretained(event)
+                }
                 let engine = Unmanaged<InputEngine>.fromOpaque(pointer).takeUnretainedValue()
                 let key = UInt16(truncatingIfNeeded: event.getIntegerValueField(.keyboardEventKeycode))
                 let flags = event.flags.rawValue
@@ -137,6 +168,7 @@ final class InputEngine {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         running = CGEvent.tapIsEnabled(tap: tap)
+        checkFloatingContextSoon()
     }
 
     private func reset() {
@@ -157,7 +189,14 @@ final class InputEngine {
             return false
         }
         guard !recording, !IsSecureEventInputEnabled() else {
+            ai.panelAppearance.setTextContext(false)
             reset()
+            return false
+        }
+        if type == .leftMouseUp {
+            if !ai.panelAppearance.floatingFrames.values.contains(where: { $0.contains(NSEvent.mouseLocation) }) {
+                checkFloatingContextSoon()
+            }
             return false
         }
         guard type == .keyDown || type == .keyUp else {
@@ -174,9 +213,37 @@ final class InputEngine {
         cancelSelection = nil
         inputRevision &+= 1
         if repeated && consumedKeys.contains(key) { return true }
+        // A fresh Quartz key-down still counts if focus changed before its previous key-up.
+        if !repeated {
+            matcher.release(key)
+            consumedKeys.remove(key)
+        }
+        if !repeated, modifiers == 0 {
+            let escape = key == UInt16(kVK_Escape) && ai.canDismiss
+            let undoShortcut = shortcuts[.undo]
+            let preserveUndo = ai.phase == .idle && undo != nil
+                && undoShortcut?.key == key && undoShortcut?.modifiers == modifiers
+            if escape && preserveUndo {
+                DispatchQueue.main.async { self.ai.cancelDictation() }
+            }
+            let cancel = escape && !preserveUndo
+            let complete = (key == UInt16(kVK_Return) || key == UInt16(kVK_ANSI_KeypadEnter))
+                && ai.phase == .recording
+            if cancel || complete {
+                matcher.reset()
+                typedLetters = 0
+                consumedKeys.insert(key)
+                DispatchQueue.main.async {
+                    if cancel { self.ai.cancelDictation() }
+                    else { self.ai.stopDictation() }
+                }
+                return true
+            }
+        }
         let action = repeated ? nil : Action.allCases.first {
             shortcuts[$0]?.key == key && shortcuts[$0]?.modifiers == modifiers
         }
+        if action == nil, !repeated { checkFloatingContextSoon() }
         if action == nil {
             matcher.reset()
             undo = nil
@@ -196,8 +263,109 @@ final class InputEngine {
         return false
     }
 
-    private func eligibleApplication() -> NSRunningApplication? {
-        guard let app = NSWorkspace.shared.frontmostApplication, let id = app.bundleIdentifier,
+    func noteApplicationActivation(_ app: NSRunningApplication?) {
+        ai.panelAppearance.setTextContext(false)
+        guard let app, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        lastExternalApplication = app
+        checkFloatingContextSoon()
+    }
+
+    func checkFloatingContextSoon() {
+        guard ai.panelAppearance.floatingVisibility == .inText, !pendingContextCheck else { return }
+        pendingContextCheck = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(110)) { [weak self] in
+            guard let self else { return }
+            self.pendingContextCheck = false
+            let appearance = self.ai.panelAppearance
+            guard self.trusted, appearance.floatingVisibility == .inText else { return }
+            let app = self.eligibleApplication()
+            let inEditor = app.map(FocusedText.hasEditorContext(in:)) ?? false
+            self.observeContext(of: app)
+            appearance.setTextContext(inEditor)
+        }
+    }
+
+    private func watchPanelMode() {
+        withObservationTracking {
+            _ = ai.panelAppearance.floatingVisibility
+        } onChange: { [weak self] in
+            Task { @MainActor in self?.watchPanelMode() }
+        }
+        if ai.panelAppearance.floatingVisibility == .inText {
+            checkFloatingContextSoon()
+        } else {
+            observeContext(of: nil)
+            ai.panelAppearance.setTextContext(false)
+        }
+    }
+
+    private func observeContext(of app: NSRunningApplication?) {
+        guard contextPID != app?.processIdentifier else { return }
+        if let observer = contextObserver {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        contextObserver = nil
+        contextPID = nil
+        guard let pid = app?.processIdentifier else { return }
+        var observer: AXObserver?
+        let result = AXObserverCreate(pid, { _, _, _, pointer in
+            guard let pointer else { return }
+            let engine = Unmanaged<InputEngine>.fromOpaque(pointer).takeUnretainedValue()
+            MainActor.assumeIsolated { engine.checkFloatingContextSoon() }
+        }, &observer)
+        guard result == .success, let observer else { return }
+        let application = AXUIElementCreateApplication(pid)
+        guard AXObserverAddNotification(observer, application, kAXFocusedUIElementChangedNotification as CFString,
+                                        Unmanaged.passUnretained(self).toOpaque()) == .success else {
+            contextPID = pid
+            return
+        }
+        contextObserver = observer
+        contextPID = pid
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+    }
+
+    func launchAI(_ action: Action, fromMenu: Bool = false) {
+        guard action == .dictation || action == .rewrite else { return }
+        if action == .dictation, ai.phase == .recording {
+            ai.stopDictation()
+            return
+        }
+        guard ai.phase == .idle else { return }
+        guard AXIsProcessTrusted(), !IsSecureEventInputEnabled() else {
+            ai.showUnavailableField()
+            return
+        }
+        let front = NSWorkspace.shared.frontmostApplication
+        let menuOwnsFocus = fromMenu && front?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+            && NSApp.keyWindow == nil
+        guard let app = eligibleApplication(menuOwnsFocus ? lastExternalApplication : front),
+              let original = FocusedText(application: app) else {
+            ai.showUnavailableField()
+            return
+        }
+        if !menuOwnsFocus {
+            performAI(action, pid: app.processIdentifier, original: original)
+            return
+        }
+        _ = app.activate()
+        let deadline = DispatchTime.now() + .milliseconds(250)
+        @MainActor func waitForMenuFocus() {
+            guard ai.phase == .idle else { return }
+            let current = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            if current == app.processIdentifier {
+                performAI(action, pid: app.processIdentifier, original: original)
+            } else if current == ProcessInfo.processInfo.processIdentifier, DispatchTime.now() < deadline {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20), execute: waitForMenuFocus)
+            } else {
+                ai.showUnavailableField()
+            }
+        }
+        waitForMenuFocus()
+    }
+
+    private func eligibleApplication(_ candidate: NSRunningApplication? = NSWorkspace.shared.frontmostApplication) -> NSRunningApplication? {
+        guard let app = candidate, !app.isTerminated, let id = app.bundleIdentifier,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
               !Self.excluded.contains(id), !id.hasPrefix("com.jetbrains."),
               !exclusions.contains(id),
@@ -209,9 +377,26 @@ final class InputEngine {
 
     private func handleShortcut(_ action: Action, key: UInt16, at time: Double,
                                 through proxy: CGEventTapProxy) -> Bool {
-        guard let app = eligibleApplication(), let shortcut = shortcuts[action] else { return false }
+        guard let shortcut = shortcuts[action] else { return false }
+        let isAIAction = action == .dictation || action == .rewrite
+        let closesPanel = isAIAction && ai.phase != .idle
+        let app = eligibleApplication()
+        guard closesPanel || app != nil else { return false }
         if action == .undo && undo == nil { return false }
         if matcher.press(shortcut, at: time) {
+            if closesPanel {
+                DispatchQueue.main.async { self.ai.cancelDictation() }
+                consumedKeys.insert(key)
+                return true
+            }
+            guard let app else { return false }
+            if isAIAction {
+                DispatchQueue.main.async {
+                    self.performAI(action, pid: app.processIdentifier)
+                }
+                consumedKeys.insert(key)
+                return true
+            }
             guard let field = FocusedText(application: app) else { return false }
             let native = app.bundleIdentifier == "com.apple.TextEdit" || field.supportsNativeReplacement
             let changed = action == .undo
@@ -221,6 +406,31 @@ final class InputEngine {
         }
         consumedKeys.insert(key)
         return true
+    }
+
+    private func performAI(_ action: Action, pid: pid_t, original: FocusedText? = nil) {
+        guard let app = eligibleApplication(), app.processIdentifier == pid else { return }
+        guard let field = FocusedText(application: app), original.map(field.matches) ?? true else {
+            ai.showUnavailableField()
+            return
+        }
+        let currentField: () -> FocusedText? = { [weak self] in
+            guard let app = self?.eligibleApplication(), app.processIdentifier == pid,
+                  let current = FocusedText(application: app), current.matches(field) else { return nil }
+            return current
+        }
+        let deliver: AIInput.Delivery = { output, completion in
+            guard let current = currentField() else { completion(false); return }
+            current.replaceAISelection(with: output, completion: completion)
+        }
+        if action == .dictation {
+            ai.startDictation(LiveDictation(original: field, revision: { [weak self] in self?.inputRevision ?? 0 }) { [weak self] in
+                guard let app = self?.eligibleApplication(), app.processIdentifier == pid else { return nil }
+                return FocusedText(application: app)
+            })
+        } else if let span = Editing.span(field.selection, in: field.value) {
+            ai.offerEdit(String(field.value[span]), isCurrent: { currentField() != nil }, destination: deliver)
+        }
     }
 
     private func checkTypedLetter(_ letter: Character, in app: NSRunningApplication,

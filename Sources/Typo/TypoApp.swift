@@ -8,7 +8,34 @@ struct TypoApp: App {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
-        MenuBarExtra("Typo", systemImage: "keyboard") {
+        MenuBarExtra("Typo AI", systemImage: launcher.engine.ai.phase == .recording ? "mic.fill" : "waveform") {
+            let ai = launcher.engine.ai
+            @Bindable var appearance = ai.panelAppearance
+            Button {
+                launcher.engine.launchAI(.dictation, fromMenu: true)
+            } label: {
+                Label(ai.phase == .recording ? "Закончить запись" : "Начать запись",
+                      systemImage: ai.phase == .recording ? "stop.circle" : FloatingControlPanel.dictationIcon)
+            }
+            .disabled(ai.phase != .idle && ai.phase != .recording)
+            Button {
+                launcher.engine.launchAI(.rewrite, fromMenu: true)
+            } label: {
+                Label("Открыть редактуру", systemImage: FloatingControlPanel.editIcon)
+            }
+            .disabled(ai.phase != .idle)
+            if ai.phase == .recording {
+                Button("Отменить запись") { ai.cancelDictation() }
+            }
+            Divider()
+            Menu("Плавающая панель") {
+                Picker("Показывать", selection: $appearance.floatingVisibility) {
+                    ForEach(FloatingVisibility.allCases) { mode in Text(mode.title).tag(mode) }
+                }
+                Button(appearance.isPlacingControls ? "Закончить перемещение" : "Переместить на экране") {
+                    appearance.isPlacingControls.toggle()
+                }
+            }
             Toggle("Автоисправление", isOn: Binding(
                 get: { launcher.engine.automatic }, set: { launcher.engine.automatic = $0 }
             ))
@@ -16,37 +43,129 @@ struct TypoApp: App {
                 Button("Проверить разрешения") { launcher.engine.start(prompt: true) }
             }
             Divider()
+            if !ai.message.isEmpty { Text(ai.message) }
+            if ai.result != nil {
+                Button("Скопировать результат") { ai.copyResult() }
+            }
+            Divider()
             Button("Настройки…") {
                 launcher.engine.start()
                 openWindow(id: "preferences")
                 NSApp.activate(ignoringOtherApps: true)
             }
-            Button("Выйти из Typo") { NSApp.terminate(nil) }
+            Button("Выйти из Typo AI") { NSApp.terminate(nil) }
                 .keyboardShortcut("q")
         }
 
-        Window("Настройки Typo", id: "preferences") {
+        Window("Настройки Typo AI", id: "preferences") {
             Preferences(engine: launcher.engine)
         }
-        .defaultSize(width: 480, height: 460)
+        .defaultSize(width: 720, height: 635)
         .windowResizability(.contentSize)
     }
 }
 
 final class Launcher: NSObject, NSApplicationDelegate {
     let engine = InputEngine()
-    func applicationDidFinishLaunching(_ notification: Notification) { engine.start() }
+    private lazy var floating = FloatingControlPanel(
+        appearance: engine.ai.panelAppearance,
+        record: { [weak self] in self?.engine.launchAI(.dictation, fromMenu: true) },
+        edit: { [weak self] in self?.engine.launchAI(.rewrite, fromMenu: true) },
+        isRecording: { [weak self] in self?.engine.ai.phase == .recording },
+        canEdit: { [weak self] in self?.engine.ai.phase == .idle }
+    )
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let workspace = NSWorkspace.shared
+        engine.noteApplicationActivation(workspace.frontmostApplication)
+        workspace.notificationCenter.addObserver(self, selector: #selector(noteActivation(_:)),
+                                                 name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        engine.start()
+        floating.start()
+    }
+
+    @objc private func noteActivation(_ notification: Notification) {
+        engine.noteApplicationActivation(notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        engine.ai.cancelDictation()
+        engine.ai.local.stop()
+    }
     func applicationDidBecomeActive(_ notification: Notification) { engine.start() }
 }
 
 private struct Preferences: View {
+    private enum Page: String, CaseIterable {
+        case general = "Общие"
+        case dictation = "Диктовка"
+        case editing = "Редактура"
+        case appearance = "Внешний вид"
+        case shortcuts = "Клавиши"
+
+        var icon: String {
+            switch self {
+            case .general: "gearshape"
+            case .dictation: FloatingControlPanel.dictationIcon
+            case .editing: FloatingControlPanel.editIcon
+            case .appearance: "slider.horizontal.3"
+            case .shortcuts: "keyboard"
+            }
+        }
+    }
+
     @Bindable var engine: InputEngine
+    @State private var page: Page = .general
     @State private var recording: Action?
     @State private var monitor: Any?
     @State private var message: String?
     @State private var exceptionWord = ""
 
     var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 5) {
+                ForEach(Page.allCases, id: \.self) { item in
+                    Button {
+                        page = item
+                    } label: {
+                        Label(item.rawValue, systemImage: item.icon)
+                            .font(.system(size: 13, weight: page == item ? .semibold : .medium))
+                            .foregroundStyle(page == item ? Color.accentColor : Color.secondary)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background {
+                                if page == item {
+                                    RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.13))
+                                }
+                            }
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(page == item ? .isSelected : [])
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Вкладки настроек")
+            Divider()
+            switch page {
+            case .general: general
+            case .dictation: dictation
+            case .editing: editing
+            case .appearance: appearance
+            case .shortcuts: shortcuts
+            }
+        }
+        .frame(width: 720, height: 635)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            stopRecording()
+        }
+    }
+
+    private var general: some View {
         Form {
             Section("Автоисправление") {
                 Toggle("Исправлять раскладку во время набора", isOn: $engine.automatic)
@@ -60,22 +179,6 @@ private struct Preferences: View {
                         Button("Запросить мониторинг ввода") { _ = CGRequestListenEventAccess() }
                     }
                 }
-            }
-
-            Section("Горячие клавиши") {
-                ForEach(Action.allCases) { action in
-                    let shortcut = engine.shortcuts[action] ?? action.initial
-                    LabeledContent(action.title) {
-                        Button(recording == action ? "Нажмите клавишу…" : Self.label(shortcut)) { record(action) }
-                            .accessibilityLabel("Назначить: " + action.title)
-                            .accessibilityValue(Self.label(shortcut))
-                    }
-                    Toggle("Двойное нажатие · " + action.title.lowercased(), isOn: Binding(
-                        get: { shortcut.double },
-                        set: { _ = engine.bind(Shortcut(key: shortcut.key, modifiers: shortcut.modifiers, double: $0), to: action) }
-                    ))
-                }
-                if let message { Text(message).foregroundStyle(.secondary) }
             }
 
             Section("Слова-исключения") {
@@ -106,11 +209,89 @@ private struct Preferences: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 500, height: 480)
-        .onDisappear { stopRecording() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
-            stopRecording()
+    }
+
+    private var dictation: some View {
+        Form {
+            Section("Локальное распознавание") {
+                @Bindable var ai = engine.ai
+                @Bindable var small = ai.local.smallModel
+                Picker("Язык диктовки", selection: $ai.speechLanguage) {
+                    Text("Русский").tag("ru")
+                    Text("Английский").tag("en")
+                    Text("Автоматически").tag("auto")
+                }
+                if ai.speechLanguage == "ru", ai.local.russianSpeechReady {
+                    Picker("Движок для русского", selection: $ai.usesGigaAM) {
+                        Text("GigaAM").tag(true)
+                        Text("Whisper").tag(false)
+                    }
+                }
+                Picker(ai.speechLanguage == "ru" && ai.local.russianSpeechReady && ai.usesGigaAM
+                           ? "Резервный Whisper" : "Модель Whisper",
+                       selection: $small.variant) {
+                    Text("Whisper Base").tag(SmallModel.Variant.base)
+                    if small.installed { Text("Whisper Small").tag(SmallModel.Variant.small) }
+                }
+                if let progress = small.progress {
+                    ProgressView("Whisper Small", value: progress)
+                    Button("Отменить загрузку") { small.cancelDownload() }
+                } else if !small.installed {
+                    Button("Скачать Whisper Small · 190 МБ") { small.startDownload() }
+                }
+                if !small.message.isEmpty { Text(small.message).foregroundStyle(.secondary) }
+            }
+
+            SpeechModelSettings(models: engine.ai.speechModels)
+            Section {
+                @Bindable var ai = engine.ai
+                Toggle("Звук после диктовки", isOn: $ai.playDictationSound)
+            }
         }
+        .formStyle(.grouped)
+    }
+
+    private var editing: some View {
+        @Bindable var ai = engine.ai
+        return Form {
+            EditActionSettings(catalog: ai.editActions)
+            CloudEditorSettings(editor: ai.cloudEditor)
+            Section {
+                Toggle("Звук после редактуры", isOn: $ai.playEditSound)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var appearance: some View {
+        ScrollView {
+            PanelAppearanceSettings(appearance: engine.ai.panelAppearance)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 18)
+        }
+    }
+
+    private var shortcuts: some View {
+        Form {
+            Section("Горячие клавиши") {
+                ForEach(Action.allCases) { action in
+                    let shortcut = engine.shortcuts[action] ?? action.initial
+                    LabeledContent(action.title) {
+                        Button(recording == action ? "Нажмите клавишу…" : Self.label(shortcut)) { record(action) }
+                            .accessibilityLabel("Назначить: " + action.title)
+                            .accessibilityValue(Self.label(shortcut))
+                    }
+                    Toggle("Двойное нажатие · " + action.title.lowercased(), isOn: Binding(
+                        get: { shortcut.double },
+                        set: { _ = engine.bind(Shortcut(key: shortcut.key, modifiers: shortcut.modifiers, double: $0), to: action) }
+                    ))
+                }
+                if let message { Text(message).foregroundStyle(.secondary) }
+            }
+
+        }
+        .formStyle(.grouped)
+        .onDisappear { stopRecording() }
     }
 
     private func addException() {
