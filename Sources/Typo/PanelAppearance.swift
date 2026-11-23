@@ -58,11 +58,12 @@ enum PanelTheme: String, CaseIterable {
                 + 0.0722 * Self.linear(color.blueComponent)
             let ink: Color = luminance > 0.179 ? .black : .white
             let backdrop = Color(nsColor: color)
-            return PanelPalette(accent: ink, backdrop: backdrop, ink: ink, swatch: backdrop, isSolid: true)
+            return PanelPalette(accent: ink, backdrop: backdrop, ink: ink, swatch: backdrop, isSolid: true,
+                                usesLightSurface: luminance > 0.179)
         }
         let monochrome = self == .black || self == .white
         return PanelPalette(accent: accent, backdrop: backdrop, ink: self == .white ? .black : .white,
-                            swatch: monochrome ? backdrop : accent, isSolid: monochrome)
+                            swatch: monochrome ? backdrop : accent, isSolid: monochrome, usesLightSurface: self == .white)
     }
 
     private static func linear(_ channel: CGFloat) -> CGFloat {
@@ -76,6 +77,7 @@ struct PanelPalette {
     let ink: Color
     let swatch: Color
     let isSolid: Bool
+    let usesLightSurface: Bool
 }
 
 enum FloatingVisibility: String, CaseIterable, Identifiable {
@@ -163,11 +165,17 @@ final class PanelAppearance {
     var usesGradient: Bool {
         didSet { defaults.set(usesGradient, forKey: "panelGradient") }
     }
+    var restingOpacity: Double {
+        didSet { defaults.set(restingOpacity, forKey: "floatingPanelOpacity") }
+    }
     var hudPosition: PanelPosition {
         didSet { Self.save(hudPosition, to: defaults, key: "hudPosition") }
     }
     var floatingVisibility: FloatingVisibility {
-        didSet { defaults.set(floatingVisibility.rawValue, forKey: "floatingVisibility") }
+        didSet {
+            defaults.set(floatingVisibility.rawValue, forKey: "floatingVisibility")
+            if isPlacingControls { isPlacingControls = false }
+        }
     }
     private(set) var hasTextContext = false
     var isPlacingControls = false
@@ -191,6 +199,8 @@ final class PanelAppearance {
         }
         size = defaults.string(forKey: "panelSize").flatMap(PanelSize.init(rawValue:)) ?? .regular
         usesGradient = defaults.object(forKey: "panelGradient") as? Bool ?? true
+        let opacity = defaults.object(forKey: "floatingPanelOpacity") as? Double ?? 0.70
+        restingOpacity = opacity.isFinite ? min(max(opacity, 0.25), 1) : 0.70
         hudPosition = Self.position(in: defaults, key: "hudPosition", legacyKey: "hudPlacement", fallback: .topCenter)
         floatingVisibility = defaults.string(forKey: "floatingVisibility").flatMap(FloatingVisibility.init(rawValue:))
             ?? (defaults.bool(forKey: "showsFloatingControls") ? .always : .hidden)

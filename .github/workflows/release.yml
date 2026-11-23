@@ -3,6 +3,8 @@ on:
   workflow_dispatch:
   push:
     tags: ['v*']
+    branches: [main]
+    paths: [Info.plist]
 
 permissions:
   contents: write
@@ -29,4 +31,5 @@ jobs:
           archive="dist/Typo-$version-macOS-$(uname -m).zip"
           ditto -c -k --sequesterRsrc --keepParent dist/Typo.app "$archive"
           unzip -tq "$archive"
-          gh release create "$tag" "$archive" --target "$GITHUB_SHA" --title "Typo $version" --generate-notes
+          if gh release view "$tag" >/dev/null 2>&1; then exit 0; fi
+          gh release create "$tag" "$archive" --target "$GITHUB_SHA" --title "Typo AI $version — публичная бета" --prerelease --generate-notes

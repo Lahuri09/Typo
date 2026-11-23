@@ -68,7 +68,8 @@ final class SpeechModels {
         preferences = updated
     }
 
-    static func transcribe(_ audio: URL, language: String, configuration: Configuration) async throws -> String {
+    static func transcribe(_ audio: URL, language: String, configuration: Configuration,
+                           session: URLSession = SpeechModels.session) async throws -> String {
         try Task.checkCancellation()
         guard let size = try? audio.resourceValues(forKeys: [.fileSizeKey]).fileSize
         else { throw SpeechModelError.audio }

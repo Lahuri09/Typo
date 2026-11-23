@@ -56,6 +56,33 @@ public enum Editing {
     }
 }
 
+public struct EditRegion {
+    public let value: String
+    public let range: NSRange
+
+    public init(value: String, range: NSRange) {
+        self.value = value
+        self.range = range
+    }
+
+    public func replacing(with text: String) -> Self? {
+        guard let span = Editing.span(range, in: value) else { return nil }
+        var updated = value
+        updated.replaceSubrange(span, with: text)
+        return Self(value: updated, range: NSRange(location: range.location, length: text.utf16.count))
+    }
+
+    public func matches(value: String, selection: NSRange, permitCaret: Bool,
+                        allowsMissingTerminalLineFeed: Bool = false) -> Bool {
+        guard Editing.span(range, in: value) != nil,
+              selection == range || (permitCaret && selection == NSRange(location: NSMaxRange(range), length: 0))
+        else { return false }
+        if value.utf16.elementsEqual(self.value.utf16) { return true }
+        return allowsMissingTerminalLineFeed
+            && DictationDraft.matches(value, expected: self.value, allowsMissingTerminalLineFeed: true)
+    }
+}
+
 public struct TextEdit {
     public let range: NSRange
     public let original: String

@@ -3,7 +3,8 @@ import SwiftUI
 import TypoCore
 
 enum ActivityStatus: Equatable {
-    case preparing, recording, transcribing, choosingEdit, rewriting, ready, inserted, dictated, unchanged, error(String)
+    case preparing, recording, transcribing, choosingEdit, refiningEdit, rewriting, ready, inserted, dictated, copied, unchanged
+    case fieldUnavailable, selectionRequired, error(String)
 
     var label: String {
         switch self {
@@ -11,11 +12,15 @@ enum ActivityStatus: Equatable {
         case .recording: "Идёт запись"
         case .transcribing: "Распознаём речь"
         case .choosingEdit: "Выберите стиль"
+        case .refiningEdit: "Уточнить редактуру"
         case .rewriting: "Редактируем текст"
         case .ready: "Результат готов"
         case .inserted: "Текст обновлён"
         case .dictated: "Диктовка вставлена"
+        case .copied: "Скопировано в буфер"
         case .unchanged: "Текст без изменений"
+        case .fieldUnavailable: "Выберите текстовое поле"
+        case .selectionRequired: "Выделите текст для обработки"
         case .error(let message): message
         }
     }
@@ -25,7 +30,9 @@ enum ActivityStatus: Equatable {
         case .preparing, .recording: "mic.fill"
         case .transcribing: "waveform"
         case .choosingEdit, .rewriting: FloatingControlPanel.editIcon
-        case .ready, .inserted, .dictated, .unchanged: "checkmark"
+        case .refiningEdit: "arrow.clockwise"
+        case .ready, .inserted, .dictated, .copied, .unchanged: "checkmark"
+        case .fieldUnavailable, .selectionRequired: "text.cursor"
         case .error: "exclamationmark"
         }
     }
@@ -33,7 +40,8 @@ enum ActivityStatus: Equatable {
     var dismissal: Duration? {
         switch self {
         case .ready: .seconds(6)
-        case .inserted, .dictated, .unchanged: .milliseconds(1500)
+        case .inserted, .dictated, .copied, .unchanged: .milliseconds(1800)
+        case .fieldUnavailable, .selectionRequired: .milliseconds(2800)
         case .error: .seconds(4)
         default: nil
         }
@@ -45,6 +53,8 @@ final class ActivityHUD {
     fileprivate let appearance: PanelAppearance
     private(set) var status: ActivityStatus?
     private(set) var actions: [EditAction] = []
+    private(set) var allowsRefinement = false
+    fileprivate private(set) var recordingCountdown: RecordingCountdown?
     fileprivate private(set) var scale: CGFloat = 1
     fileprivate private(set) var chooserHeight: CGFloat = 0
     @ObservationIgnored private var panel: OverlayPanel?
@@ -57,30 +67,49 @@ final class ActivityHUD {
     private let complete: () -> Void
     private let chooseEdit: (EditAction) -> Void
     private let copyEditResult: () -> Void
+    private let refineEdit: () -> Void
+    private let submitRevision: (String?) -> Void
+    private let didHide: () -> Void
 
     init(appearance: PanelAppearance, level: @escaping () -> Double, cancel: @escaping () -> Void,
          complete: @escaping () -> Void, chooseEdit: @escaping (EditAction) -> Void = { _ in },
-         copyEditResult: @escaping () -> Void = {}) {
+         copyEditResult: @escaping () -> Void = {}, refineEdit: @escaping () -> Void = {},
+         submitRevision: @escaping (String?) -> Void = { _ in }, didHide: @escaping () -> Void = {}) {
         self.appearance = appearance
         self.level = level
         self.cancel = cancel
         self.complete = complete
         self.chooseEdit = chooseEdit
         self.copyEditResult = copyEditResult
+        self.refineEdit = refineEdit
+        self.submitRevision = submitRevision
+        self.didHide = didHide
     }
 
-    func show(_ next: ActivityStatus, actions: [EditAction] = []) {
+    func show(_ next: ActivityStatus, actions: [EditAction] = [], allowsRefinement: Bool = false,
+              countdown: RecordingCountdown? = nil) {
         dismissal?.cancel()
         visibilityRevision += 1
         let window = panel ?? makePanel()
         let showing = status == nil || !window.isVisible
+        let takesKeyboard = next == .refiningEdit
         let revision = visibilityRevision
         if next == .choosingEdit { self.actions = actions }
+        if next == .recording { recordingCountdown = countdown }
+        self.allowsRefinement = allowsRefinement
+        if window.acceptsKeyboardInput && !takesKeyboard { window.orderOut(nil) }
+        window.acceptsKeyboardInput = takesKeyboard
         updateLayout(for: next, on: showing ? NSScreen.underPointer : window.screen, preserveSize: !showing)
         window.ignoresMouseEvents = next != .recording && next != .choosingEdit && next != .ready
-        if showing && !window.isVisible { window.orderFrontRegardless() }
-        let animation = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            ? Animation.easeOut(duration: 0.12) : .spring(duration: showing ? 0.36 : 0.29, bounce: showing ? 0.17 : 0.07)
+            && !takesKeyboard && !allowsRefinement
+        if !window.isVisible { window.orderFrontRegardless() }
+        let animation: Animation = if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            .easeOut(duration: 0.12)
+        } else if next == .fieldUnavailable {
+            .easeOut(duration: 0.28)
+        } else {
+            .spring(duration: showing ? 0.42 : 0.32, bounce: showing ? 0.08 : 0.03)
+        }
         withAnimation(animation, completionCriteria: .removed) {
             status = next
         } completion: { [weak self] in
@@ -89,7 +118,8 @@ final class ActivityHUD {
                 self.refreshLayout()
             }
         }
-        if let duration = next.dismissal {
+        if takesKeyboard { window.makeKey() }
+        if let duration = allowsRefinement ? .seconds(8) : next.dismissal {
             dismissal = Task { [weak self] in
                 do { try await Task.sleep(for: duration) } catch { return }
                 self?.hide()
@@ -100,11 +130,14 @@ final class ActivityHUD {
     func hide() {
         guard status != nil, let window = panel else { return }
         dismissal?.cancel()
+        didHide()
         visibilityRevision += 1
         let revision = visibilityRevision
         window.ignoresMouseEvents = true
+        if window.acceptsKeyboardInput { window.resignKey() }
+        window.acceptsKeyboardInput = false
         let animation = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-            ? Animation.easeOut(duration: 0.12) : .easeInOut(duration: 0.25)
+            ? Animation.easeOut(duration: 0.12) : .easeInOut(duration: 0.24)
         withAnimation(animation, completionCriteria: .removed) {
             status = nil
         } completion: { [weak self] in
@@ -117,7 +150,8 @@ final class ActivityHUD {
         let window = OverlayPanel(size: Self.windowSize(for: .transcribing, scale: appearance.size.scale),
                                   content: ActivityView(model: self, level: level,
                                                         cancel: cancel, complete: complete,
-                                                        chooseEdit: chooseEdit, copyEditResult: copyEditResult))
+                                                        chooseEdit: chooseEdit, copyEditResult: copyEditResult,
+                                                        refineEdit: refineEdit, submitRevision: submitRevision))
         panel = window
         return window
     }
@@ -125,10 +159,16 @@ final class ActivityHUD {
     static func contentSize(for status: ActivityStatus, chooserHeight: CGFloat = 0) -> CGSize {
         let width: CGFloat = switch status {
         case .choosingEdit: 446
-        case .recording: 233
+        case .refiningEdit: 402
+        case .recording: 282
         default: 285
         }
-        return CGSize(width: width, height: status == .choosingEdit ? chooserHeight : 48)
+        let height: CGFloat = switch status {
+        case .choosingEdit: chooserHeight
+        case .refiningEdit: 106
+        default: 48
+        }
+        return CGSize(width: width, height: height)
     }
 
     static func windowSize(for status: ActivityStatus, scale: CGFloat, chooserHeight: CGFloat = 0) -> CGSize {
@@ -190,6 +230,8 @@ private struct ActivityView: View {
     let complete: () -> Void
     let chooseEdit: (EditAction) -> Void
     let copyEditResult: () -> Void
+    let refineEdit: () -> Void
+    let submitRevision: (String?) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var theme: PanelPalette { model.appearance.palette }
     private var accent: Color { theme.accent }
@@ -201,14 +243,15 @@ private struct ActivityView: View {
         let anchor = UnitPoint(x: position.horizontal, y: position.vertical)
         ActivityPositionLayout(position: position) {
             if let status = model.status {
+                let feedback = status == .fieldUnavailable
                 shell(status)
                     .transition(reduceMotion ? .opacity : .asymmetric(
                         insertion: .opacity
-                            .combined(with: .offset(y: 8 * direction))
-                            .combined(with: .scale(scale: 0.88, anchor: anchor)),
+                            .combined(with: .offset(y: (feedback ? 4 : 8) * direction))
+                            .combined(with: .scale(scale: feedback ? 0.96 : 0.88, anchor: anchor)),
                         removal: .opacity
-                            .combined(with: .offset(y: 5 * direction))
-                            .combined(with: .scale(scale: 0.93, anchor: anchor))
+                            .combined(with: .offset(y: (feedback ? 2 : 5) * direction))
+                            .combined(with: .scale(scale: feedback ? 0.98 : 0.93, anchor: anchor))
                     ))
             }
         }
@@ -235,6 +278,10 @@ private struct ActivityView: View {
             if choosing {
                 editChooser.frame(width: size.width, height: size.height, alignment: .top)
                     .transition(.opacity)
+            } else if status == .refiningEdit {
+                EditRefinementView(theme: theme, cancel: cancel, submit: submitRevision)
+                    .frame(width: size.width, height: size.height)
+                    .transition(.opacity)
             } else {
                 content(status)
                     .frame(width: size.width, height: size.height)
@@ -243,9 +290,13 @@ private struct ActivityView: View {
         }
         .frame(width: size.width, height: size.height, alignment: .top)
         .modifier(PanelChrome(theme: theme, cornerRadius: choosing ? 23 : 24, emphasis: choosing ? 0.24 : 0.19,
-                              usesGradient: model.appearance.usesGradient))
+                              usesGradient: model.appearance.usesGradient, edgeTint: status == .fieldUnavailable ? warningTint : nil))
         .scaleEffect(scale)
         .frame(width: size.width * scale, height: size.height * scale)
+    }
+
+    private var warningTint: Color {
+        theme.usesLightSurface ? Color(red: 0.66, green: 0.20, blue: 0.24) : Color(red: 1, green: 0.45, blue: 0.47)
     }
 
     private var editChooser: some View {
@@ -275,7 +326,6 @@ private struct ActivityView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Закрыть выбор")
-                .help("Закрыть выбор (Esc)")
             }
 
             if model.actions.isEmpty {
@@ -324,7 +374,6 @@ private struct ActivityView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Отменить запись")
-                .help("Отменить запись")
 
                 Image(systemName: "mic.fill")
                     .font(.system(size: 13, weight: .medium))
@@ -335,6 +384,10 @@ private struct ActivityView: View {
                     .frame(width: 91, height: 23)
                     .accessibilityHidden(true)
 
+                if let countdown = model.recordingCountdown {
+                    RecordingTimer(countdown: countdown, onLightSurface: theme.usesLightSurface)
+                }
+
                 Button(action: complete) {
                     Image(systemName: "arrow.up").font(.system(size: 14, weight: .bold))
                         .foregroundStyle(theme.backdrop)
@@ -344,13 +397,12 @@ private struct ActivityView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Закончить и распознать")
-                .help("Закончить и распознать")
             }
         } else {
             HStack(spacing: 9) {
                 Image(systemName: status.icon)
                     .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(accent)
+                    .foregroundStyle(status == .fieldUnavailable ? warningTint : accent)
                     .accessibilityHidden(true)
                 Text(status.label)
                     .contentTransition(.opacity)
@@ -369,6 +421,17 @@ private struct ActivityView: View {
                             .contentShape(Capsule())
                     }
                     .buttonStyle(.plain)
+                } else if model.allowsRefinement && (status == .inserted || status == .unchanged) {
+                    Button(action: refineEdit) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(accent)
+                            .frame(width: 32, height: 32)
+                            .background(accent.opacity(0.15), in: Circle())
+                            .contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Уточнить или повторить редактуру")
                 } else if status.dismissal == nil {
                     ProgressView().controlSize(.small).tint(theme.ink.opacity(0.85))
                         .accessibilityHidden(true)
@@ -376,8 +439,95 @@ private struct ActivityView: View {
             }
             .padding(.horizontal, 9)
             .frame(maxWidth: 260)
-            .accessibilityElement(children: status == .ready ? .contain : .combine)
+            .accessibilityElement(children: status == .ready || model.allowsRefinement ? .contain : .combine)
         }
+    }
+}
+
+struct RecordingTimer: View {
+    let countdown: RecordingCountdown
+    let onLightSurface: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let reading = countdown.reading()
+            let seconds = reading.seconds
+            Text(String(format: "%d:%02d", seconds / 60, seconds % 60))
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(reading.isWarning ? Color(red: 1, green: 0.46, blue: 0.46) : .white)
+                .frame(width: 36, height: 22)
+                .background(onLightSurface ? Color.black.opacity(0.78) : .clear, in: Capsule())
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: reading.isWarning)
+                .accessibilityLabel(reading.isWarning ? "Запись скоро завершится" : "До конца записи")
+                .accessibilityValue(Text(Duration.seconds(seconds).formatted(.units(
+                    allowed: [.minutes, .seconds], width: .wide))))
+        }
+    }
+}
+
+private struct EditRefinementView: View {
+    let theme: PanelPalette
+    let cancel: () -> Void
+    let submit: (String?) -> Void
+    @State private var details = ""
+    @FocusState private var focused: Bool
+
+    private var instruction: String { details.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text(ActivityStatus.refiningEdit.label)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(theme.ink)
+                Spacer()
+                Button("Новый вариант", systemImage: "arrow.clockwise") { submit(nil) }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(theme.accent)
+                    .buttonStyle(.plain)
+                Button(action: cancel) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(theme.ink)
+                        .frame(width: 24, height: 24)
+                        .background(theme.ink.opacity(0.10), in: Circle())
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Закрыть уточнение")
+            }
+            HStack(spacing: 8) {
+                TextField("Что изменить?", text: $details, prompt: Text("Что изменить?")
+                    .foregroundStyle(theme.ink.opacity(0.55)))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13))
+                    .foregroundStyle(theme.ink)
+                    .padding(9)
+                    .background(theme.ink.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+                    .focused($focused)
+                    .onSubmit(apply)
+                Button(action: apply) {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.backdrop)
+                        .frame(width: 32, height: 32)
+                        .background(theme.accent.opacity(instruction.isEmpty ? 0.45 : 1), in: Circle())
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .disabled(instruction.isEmpty)
+                .accessibilityLabel("Применить уточнение")
+            }
+        }
+        .padding(15)
+        .onAppear { focused = true }
+        .onExitCommand(perform: cancel)
+    }
+
+    private func apply() {
+        guard !instruction.isEmpty else { return }
+        submit(String(instruction.prefix(1_000)))
     }
 }
 
@@ -394,7 +544,7 @@ private struct EditActionLabel: View {
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(accent)
                 .frame(width: 27, height: 27)
-                .background(ink.opacity(0.075), in: RoundedRectangle(cornerRadius: 7))
+                .background(accent.opacity(hovered ? 0.19 : 0.09), in: RoundedRectangle(cornerRadius: 7))
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 3) {
@@ -409,15 +559,21 @@ private struct EditActionLabel: View {
             }
 
             Spacer(minLength: 0)
+            Image(systemName: "arrow.up.right")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(accent)
+                .opacity(hovered ? 0.9 : 0)
+                .offset(x: hovered || reduceMotion ? 0 : -3)
+                .accessibilityHidden(true)
         }
         .padding(.horizontal, 9)
         .frame(height: 54)
-        .background(ink.opacity(hovered ? 0.14 : 0.065), in: RoundedRectangle(cornerRadius: 11))
-        .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(ink.opacity(hovered ? 0.18 : 0.065), lineWidth: 1) }
+        .background(accent.opacity(hovered ? 0.14 : 0.045), in: RoundedRectangle(cornerRadius: 11))
+        .overlay { RoundedRectangle(cornerRadius: 11).strokeBorder(accent.opacity(hovered ? 0.30 : 0.08), lineWidth: 1) }
         .contentShape(RoundedRectangle(cornerRadius: 11))
         .accessibilityElement(children: .combine)
         .onHover { next in
-            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.12)) { hovered = next }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.17)) { hovered = next }
         }
     }
 }

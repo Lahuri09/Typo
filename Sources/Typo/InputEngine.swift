@@ -70,6 +70,7 @@ final class InputEngine {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     @ObservationIgnored private var pendingContextCheck = false
+    @ObservationIgnored private var contextClick: CGPoint?
     @ObservationIgnored private var watchesPanelMode = false
     @ObservationIgnored private var contextObserver: AXObserver?
     @ObservationIgnored private var contextPID: pid_t?
@@ -98,7 +99,16 @@ final class InputEngine {
         return true
     }
 
+    func requestAccess() {
+        start(prompt: !AXIsProcessTrusted())
+        if trusted, !running {
+            _ = CGRequestListenEventAccess()
+            start()
+        }
+    }
+
     func start(prompt: Bool = false) {
+        ai.refreshMicrophoneAccess()
         if !watchesPanelMode {
             watchesPanelMode = true
             watchPanelMode()
@@ -124,7 +134,8 @@ final class InputEngine {
             return
         }
 
-        let types: [CGEventType] = [.keyDown, .keyUp, .leftMouseDown, .leftMouseUp, .rightMouseDown, .otherMouseDown]
+        let types: [CGEventType] = [.keyDown, .keyUp, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+                                    .otherMouseDown, .otherMouseUp]
         let mask = types.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
@@ -152,9 +163,10 @@ final class InputEngine {
                     }
                 }
                 let typedLetter = letter
+                let location = event.location
                 let proxyAddress = UInt(bitPattern: proxy)
                 let consumed = MainActor.assumeIsolated {
-                    engine.handle(type, key: key, flags: flags, repeated: repeated, letter: typedLetter, at: timestamp,
+                    engine.handle(type, key: key, flags: flags, repeated: repeated, letter: typedLetter, at: timestamp, location: location,
                                   through: OpaquePointer(bitPattern: proxyAddress)!)
                 }
                 return consumed ? nil : Unmanaged.passUnretained(event)
@@ -182,7 +194,7 @@ final class InputEngine {
     }
 
     private func handle(_ type: CGEventType, key: UInt16, flags: UInt64, repeated: Bool, letter: Character?, at time: Double,
-                        through proxy: CGEventTapProxy) -> Bool {
+                        location: CGPoint, through proxy: CGEventTapProxy) -> Bool {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             reset()
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
@@ -193,8 +205,10 @@ final class InputEngine {
             reset()
             return false
         }
-        if type == .leftMouseUp {
-            if !ai.panelAppearance.floatingFrames.values.contains(where: { $0.contains(NSEvent.mouseLocation) }) {
+        if type == .leftMouseUp || type == .rightMouseUp || type == .otherMouseUp {
+            if ai.panelAppearance.floatingVisibility == .inText,
+               !ai.panelAppearance.floatingFrames.values.contains(where: { $0.contains(NSEvent.mouseLocation) }) {
+                contextClick = location
                 checkFloatingContextSoon()
             }
             return false
@@ -218,7 +232,15 @@ final class InputEngine {
             matcher.release(key)
             consumedKeys.remove(key)
         }
+        if ai.phase == .refiningEdit, key != UInt16(kVK_Escape) || modifiers != 0 {
+            return false
+        }
         if !repeated, modifiers == 0 {
+            if key == UInt16(kVK_Escape), ai.panelAppearance.isPlacingControls {
+                ai.panelAppearance.isPlacingControls = false
+                consumedKeys.insert(key)
+                return true
+            }
             let escape = key == UInt16(kVK_Escape) && ai.canDismiss
             let undoShortcut = shortcuts[.undo]
             let preserveUndo = ai.phase == .idle && undo != nil
@@ -243,7 +265,11 @@ final class InputEngine {
         let action = repeated ? nil : Action.allCases.first {
             shortcuts[$0]?.key == key && shortcuts[$0]?.modifiers == modifiers
         }
-        if action == nil, !repeated { checkFloatingContextSoon() }
+        if action == nil, !repeated,
+           letter != nil || key == UInt16(kVK_Tab) || key == UInt16(kVK_Return) || key == UInt16(kVK_Delete) {
+            contextClick = nil
+            checkFloatingContextSoon()
+        }
         if action == nil {
             matcher.reset()
             undo = nil
@@ -264,6 +290,7 @@ final class InputEngine {
     }
 
     func noteApplicationActivation(_ app: NSRunningApplication?) {
+        contextClick = nil
         ai.panelAppearance.setTextContext(false)
         guard let app, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
         lastExternalApplication = app
@@ -279,7 +306,7 @@ final class InputEngine {
             let appearance = self.ai.panelAppearance
             guard self.trusted, appearance.floatingVisibility == .inText else { return }
             let app = self.eligibleApplication()
-            let inEditor = app.map(FocusedText.hasEditorContext(in:)) ?? false
+            let inEditor = app.map { FocusedText.hasEditorContext(in: $0, click: self.contextClick) } ?? false
             self.observeContext(of: app)
             appearance.setTextContext(inEditor)
         }
@@ -295,6 +322,7 @@ final class InputEngine {
             checkFloatingContextSoon()
         } else {
             observeContext(of: nil)
+            contextClick = nil
             ai.panelAppearance.setTextContext(false)
         }
     }
@@ -332,16 +360,17 @@ final class InputEngine {
             return
         }
         guard ai.phase == .idle else { return }
-        guard AXIsProcessTrusted(), !IsSecureEventInputEnabled() else {
+        guard !IsSecureEventInputEnabled() else {
             ai.showUnavailableField()
             return
         }
+        guard AXIsProcessTrusted() else { openWithoutField(action); return }
         let front = NSWorkspace.shared.frontmostApplication
         let menuOwnsFocus = fromMenu && front?.processIdentifier == ProcessInfo.processInfo.processIdentifier
             && NSApp.keyWindow == nil
         guard let app = eligibleApplication(menuOwnsFocus ? lastExternalApplication : front),
               let original = FocusedText(application: app) else {
-            ai.showUnavailableField()
+            openWithoutField(action)
             return
         }
         if !menuOwnsFocus {
@@ -358,10 +387,15 @@ final class InputEngine {
             } else if current == ProcessInfo.processInfo.processIdentifier, DispatchTime.now() < deadline {
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(20), execute: waitForMenuFocus)
             } else {
-                ai.showUnavailableField()
+                openWithoutField(action)
             }
         }
         waitForMenuFocus()
+    }
+
+    private func openWithoutField(_ action: Action) {
+        if action == .dictation { ai.startDictation() }
+        else { ai.promptForEditSelection() }
     }
 
     private func eligibleApplication(_ candidate: NSRunningApplication? = NSWorkspace.shared.frontmostApplication) -> NSRunningApplication? {
@@ -380,23 +414,27 @@ final class InputEngine {
         guard let shortcut = shortcuts[action] else { return false }
         let isAIAction = action == .dictation || action == .rewrite
         let closesPanel = isAIAction && ai.phase != .idle
-        let app = eligibleApplication()
-        guard closesPanel || app != nil else { return false }
+        let front = NSWorkspace.shared.frontmostApplication
+        let app = eligibleApplication(front)
+        let noExternalApp = front == nil || front?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+        let standaloneDictation = action == .dictation && ai.dictationFallback != .disabled
+        guard closesPanel || app != nil || (isAIAction && noExternalApp) || standaloneDictation else { return false }
         if action == .undo && undo == nil { return false }
         if matcher.press(shortcut, at: time) {
             if closesPanel {
-                DispatchQueue.main.async { self.ai.cancelDictation() }
-                consumedKeys.insert(key)
-                return true
-            }
-            guard let app else { return false }
-            if isAIAction {
                 DispatchQueue.main.async {
-                    self.performAI(action, pid: app.processIdentifier)
+                    if action == .dictation && self.ai.phase == .recording { self.ai.stopDictation() }
+                    else { self.ai.cancelDictation() }
                 }
                 consumedKeys.insert(key)
                 return true
             }
+            if isAIAction {
+                DispatchQueue.main.async { self.launchAI(action) }
+                consumedKeys.insert(key)
+                return true
+            }
+            guard let app else { return false }
             guard let field = FocusedText(application: app) else { return false }
             let native = app.bundleIdentifier == "com.apple.TextEdit" || field.supportsNativeReplacement
             let changed = action == .undo
@@ -409,19 +447,11 @@ final class InputEngine {
     }
 
     private func performAI(_ action: Action, pid: pid_t, original: FocusedText? = nil) {
-        guard let app = eligibleApplication(), app.processIdentifier == pid else { return }
+        guard !IsSecureEventInputEnabled() else { ai.showUnavailableField(); return }
+        guard let app = eligibleApplication(), app.processIdentifier == pid else { openWithoutField(action); return }
         guard let field = FocusedText(application: app), original.map(field.matches) ?? true else {
-            ai.showUnavailableField()
+            openWithoutField(action)
             return
-        }
-        let currentField: () -> FocusedText? = { [weak self] in
-            guard let app = self?.eligibleApplication(), app.processIdentifier == pid,
-                  let current = FocusedText(application: app), current.matches(field) else { return nil }
-            return current
-        }
-        let deliver: AIInput.Delivery = { output, completion in
-            guard let current = currentField() else { completion(false); return }
-            current.replaceAISelection(with: output, completion: completion)
         }
         if action == .dictation {
             ai.startDictation(LiveDictation(original: field, revision: { [weak self] in self?.inputRevision ?? 0 }) { [weak self] in
@@ -429,8 +459,34 @@ final class InputEngine {
                 return FocusedText(application: app)
             })
         } else if let span = Editing.span(field.selection, in: field.value) {
-            ai.offerEdit(String(field.value[span]), isCurrent: { currentField() != nil }, destination: deliver)
+            let region = EditRegion(value: field.value, range: field.selection)
+            ai.offerEdit(String(field.value[span]), target: editTarget(in: field, pid: pid, region: region))
+        } else {
+            ai.promptForEditSelection()
         }
+    }
+
+    private func editTarget(in anchor: FocusedText, pid: pid_t, region: EditRegion,
+                            permitCaret: Bool = false) -> AIInput.EditTarget {
+        let currentField: () -> FocusedText? = { [weak self] in
+            guard let app = self?.eligibleApplication(), app.processIdentifier == pid,
+                  let current = FocusedText(application: app), current.sameElement(as: anchor),
+                  region.matches(value: current.value, selection: current.selection, permitCaret: permitCaret,
+                                 allowsMissingTerminalLineFeed: permitCaret && current.usesComposerLineFeed)
+            else { return nil }
+            return current
+        }
+        return AIInput.EditTarget(
+            isCurrent: { currentField() != nil },
+            deliver: { output, completion in
+                guard let current = currentField() else { completion(false); return }
+                current.replaceAISelection(region.range, with: output, completion: completion)
+            },
+            afterReplacing: { [weak self] output in
+                guard let next = region.replacing(with: output) else { return nil }
+                return self?.editTarget(in: anchor, pid: pid, region: next, permitCaret: true)
+            }
+        )
     }
 
     private func checkTypedLetter(_ letter: Character, in app: NSRunningApplication,

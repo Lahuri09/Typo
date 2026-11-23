@@ -187,27 +187,68 @@ final class LocalAI {
         return false
     }
 
-    func edit(_ original: String, preset: EditPreset, custom: String,
-              cloud: CloudEditor.Configuration? = nil) async throws -> String {
+    func edit(_ original: String, preset: EditPreset, custom: String, shortening: ShorteningStrength = .gentle,
+              cloud: CloudEditor.Configuration? = nil, revision: EditRevision? = nil) async throws -> String {
+        if preset == .concise, cloud == nil, revision == nil, original.utf16.count > 2_600 {
+            let text = shortening.removingRepeatedParagraphs(in: original)
+            if text.utf16.count > 2_600 {
+                let groups = ShorteningStrength.paragraphGroups(in: text)
+                if groups.count > 1 {
+                    var edited: [String] = []
+                    for group in groups {
+                        try Task.checkCancellation()
+                        let replacement: String
+                        do {
+                            replacement = try await editSelection(group, preset: preset, custom: custom,
+                                                                  shortening: shortening, cloud: nil, revision: nil)
+                        } catch Failure.noChanges, Failure.invalidEdit {
+                            replacement = group
+                        }
+                        edited.append(replacement)
+                    }
+                    let output = edited.joined(separator: "\n\n")
+                    if shortening.accepts(output, replacing: original) { return output }
+                    if shortening.accepts(text, replacing: original) { return text }
+                    throw Failure.invalidEdit
+                }
+            }
+        }
+        return try await editSelection(original, preset: preset, custom: custom, shortening: shortening,
+                                       cloud: cloud, revision: revision)
+    }
+
+    private func editSelection(_ original: String, preset: EditPreset, custom: String, shortening: ShorteningStrength,
+                               cloud: CloudEditor.Configuration?, revision: EditRevision?) async throws -> String {
         try Task.checkCancellation()
         let appliesStyle = [.concise, .business, .conversational, .custom].contains(preset)
-        let prepared = preset == .punctuation ? original : Self.correctSpelling(original)
+        let business = preset == .business
+        let input = business ? EditPreset.neutralizingBusinessExpressions(in: original) : original
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw Failure.invalidEdit }
+        let prepared = preset == .punctuation ? input : Self.correctSpelling(input, preservingProfanity: business)
         let punctuation = appliesStyle ? EditPreset.proofread : preset
         let corrected = punctuation.fixingBasicPunctuation(in: prepared)
-        let source = preset == .business ? EditPreset.concise.removingFiller(from: corrected) : corrected
-        if preset == .spelling {
+        let source = switch preset {
+        case .business: EditPreset.concise.removingFiller(from: corrected)
+        case .concise: preset.removingFiller(from: shortening.removingRepeatedParagraphs(in: corrected))
+        default: corrected
+        }
+        if preset == .spelling, revision == nil {
             guard source != original else { throw Failure.noChanges }
+            return source
+        }
+        if cloud == nil, preset == .concise, shortening == .gentle, revision == nil,
+           shortening.accepts(source, replacing: original) {
             return source
         }
 
         var unchanged = false
         var backendError: Error?
-        let styleInstruction = preset.instruction(custom: custom, source: source)
+        let styleInstruction = preset.instruction(custom: custom, source: source, shortening: shortening)
         let writingInstruction = "Correct spelling, grammar, capitalization and punctuation in the result. Preserve the meaning, facts and point of view, and adjust the tone only as requested by the editing rule."
         let instruction = switch preset {
         case .custom:
             "\(writingInstruction) Keep the original word order where possible and punctuate complete sentences.\nEditing style: \(styleInstruction)"
-        case .concise, .business, .conversational:
+        case .concise, .conversational:
             "\(styleInstruction)\n\(writingInstruction)"
         default:
             styleInstruction
@@ -215,18 +256,27 @@ final class LocalAI {
         let retry = preset == .proofread
             ? instruction + "\nCheck punctuation and sentence capitalization even if spelling is already correct."
             : instruction + "\nReturn only the edited source. Follow the editing rule, keep the original facts and point of view."
-        for rule in cloud == nil ? [instruction, retry] : [instruction] {
+        let hasLongProofreadFallback = preset == .proofread && source.utf16.count > 4_000 && source != original
+        func accepts(_ text: String) -> Bool {
+            preset == .concise ? shortening.accepts(text, replacing: original) : preset.accepts(text, replacing: original)
+        }
+        for rule in cloud == nil && !hasLongProofreadFallback ? [instruction, retry] : [instruction] {
             do {
                 let output = if let cloud {
-                    try await CloudEditor.rewrite(source, instruction: rule, configuration: cloud)
+                    try await CloudEditor.rewrite(source, instruction: rule, configuration: cloud, revision: revision)
                 } else {
-                    try await rewrite(source, instruction: rule)
+                    try await rewrite(source, instruction: rule, revision: revision)
                 }
-                let polished = appliesStyle ? punctuation.fixingBasicPunctuation(in: Self.correctSpelling(output)) : output
+                let neutral = business ? EditPreset.neutralizingBusinessExpressions(in: output) : output
+                let polished = appliesStyle
+                    ? punctuation.fixingBasicPunctuation(in: Self.correctSpelling(neutral, preservingProfanity: business))
+                    : output
                 let edited = preset.removingFiller(from: polished)
                 if !edited.isEmpty, !AIRequest.isConversationalRefusal(edited, source: original),
-                   preset.accepts(edited, replacing: original) {
-                    if edited != source, edited != original { return edited }
+                   accepts(edited) {
+                    if let revision {
+                        if edited != revision.previous { return edited }
+                    } else if edited != source, edited != original { return edited }
                     unchanged = true
                 }
             } catch is DecodingError {
@@ -239,18 +289,19 @@ final class LocalAI {
             }
         }
         let fallback = preset.removingFiller(from: source)
-        if fallback != original, (preset != .concise || fallback != source),
-           preset.accepts(fallback, replacing: original) { return fallback }
+        if revision == nil, fallback != original, accepts(fallback) { return fallback }
         if unchanged { throw Failure.noChanges }
         throw backendError ?? Failure.invalidEdit
     }
 
-    private static func correctSpelling(_ text: String) -> String {
+    private static func correctSpelling(_ text: String, preservingProfanity: Bool) -> String {
         let checker = NSSpellChecker.shared
         let words = text.ranges(of: /\b[A-Za-zА-Яа-яЁё]{3,}\b/)
         var output = text
         for range in words.reversed() {
             let word = String(text[range])
+            // Redirect profanity to the business rewrite, before the spellchecker can reinterpret it.
+            if preservingProfanity, EditPreset.containsProfanity(word) { continue }
             guard let layout = Layout.of(word) else { continue }
             let language = layout == .russian ? "ru" : "en"
             let fullWord = NSRange(location: 0, length: word.utf16.count)
@@ -268,7 +319,7 @@ final class LocalAI {
         return output
     }
 
-    private func rewrite(_ text: String, instruction: String) async throws -> String {
+    private func rewrite(_ text: String, instruction: String, revision: EditRevision? = nil) async throws -> String {
         try Task.checkCancellation()
         guard editorReady else { throw Failure.missingEditor }
         if server?.isRunning != true {
@@ -285,7 +336,7 @@ final class LocalAI {
             guard server?.isRunning == true else { break }
             if let (_, response) = try? await session.data(for: health),
                (response as? HTTPURLResponse)?.statusCode == 200 {
-                let request = try AIRequest.rewrite(text, instruction: instruction, endpoint: endpoint)
+                let request = try AIRequest.rewrite(text, instruction: instruction, endpoint: endpoint, revision: revision)
                 let (data, result) = try await session.data(for: request)
                 guard (result as? HTTPURLResponse)?.statusCode == 200 else { throw Failure.editor }
                 return try AIRequest.result(from: data)

@@ -7,6 +7,31 @@ import TypoCore
 let inputLog = Logger(subsystem: "local.typo.Switcher", category: "Input")
 let dictationEventMarker: Int64 = 0x5479706F
 
+struct PasteboardSnapshot {
+    let changeCount: Int
+    private let items: [NSPasteboardItem]
+
+    init?(_ pasteboard: NSPasteboard) {
+        changeCount = pasteboard.changeCount
+        var copies: [NSPasteboardItem] = []
+        for item in pasteboard.pasteboardItems ?? [] {
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                guard let data = item.data(forType: type), copy.setData(data, forType: type) else { return nil }
+            }
+            copies.append(copy)
+        }
+        guard pasteboard.changeCount == changeCount else { return nil }
+        items = copies
+    }
+
+    func restore(to pasteboard: NSPasteboard, ifUnchangedSince replacementCount: Int) {
+        guard pasteboard.changeCount == replacementCount else { return }
+        pasteboard.clearContents()
+        if !items.isEmpty { pasteboard.writeObjects(items) }
+    }
+}
+
 struct FocusedText {
     private static var pasteInProgress = false
     let element: AXUIElement
@@ -29,9 +54,21 @@ struct FocusedText {
         self.value = value
     }
 
-    static func hasEditorContext(in application: NSRunningApplication) -> Bool {
-        guard let element = editorElement(in: application, diagnostics: false) else { return false }
-        return range(element) != nil
+    static func hasEditorContext(in application: NSRunningApplication, click: CGPoint?) -> Bool {
+        guard let element = editorElement(in: application, diagnostics: false), range(element) != nil else { return false }
+        guard let click, let bounds = editorBounds(element) else { return true }
+        // Some editors keep AX focus on a composer after a click elsewhere in the window.
+        return bounds.insetBy(dx: -3, dy: -3).contains(click)
+    }
+
+    private static func editorBounds(_ element: AXUIElement) -> CGRect? {
+        guard let position = read(element, kAXPositionAttribute), CFGetTypeID(position) == AXValueGetTypeID(),
+              let dimensions = read(element, kAXSizeAttribute), CFGetTypeID(dimensions) == AXValueGetTypeID() else { return nil }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(position as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(dimensions as! AXValue, .cgSize, &size), size.width > 0, size.height > 0 else { return nil }
+        return CGRect(origin: origin, size: size)
     }
 
     private static func editorElement(in application: NSRunningApplication, diagnostics: Bool) -> AXUIElement? {
@@ -247,15 +284,15 @@ struct FocusedText {
         return [down, up]
     }
 
-    func replaceAISelection(with replacement: String, completion: @escaping (Bool) -> Void) {
+    func replaceAISelection(_ range: NSRange, with replacement: String, completion: @escaping (Bool) -> Void) {
         guard !Self.pasteInProgress, !replacement.isEmpty else { completion(false); return }
         if supportsNativeReplacement,
-           let applied = replaceNatively(selection, with: replacement,
-                                         caret: selection.location + replacement.utf16.count) {
+           let applied = replaceNatively(range, with: replacement,
+                                         caret: range.location + replacement.utf16.count) {
             completion(applied)
             return
         }
-        if !replace(selection, with: replacement, through: nil,
+        if !replace(range, with: replacement, through: nil,
                     aiPaste: true, completion: completion) {
             completion(false)
         }
@@ -280,19 +317,7 @@ struct FocusedText {
         }
 
         let pasteboard = NSPasteboard.general
-        let initialCount = pasteboard.changeCount
-        var savedItems: [NSPasteboardItem] = []
-        for item in pasteboard.pasteboardItems ?? [] {
-            let copy = NSPasteboardItem()
-            for type in item.types {
-                guard let data = item.data(forType: type), copy.setData(data, forType: type) else {
-                    if range != selection && Self.range(element) == range { _ = setSelection(selection) }
-                    return false
-                }
-            }
-            savedItems.append(copy)
-        }
-        guard pasteboard.changeCount == initialCount,
+        guard let saved = PasteboardSnapshot(pasteboard), pasteboard.changeCount == saved.changeCount,
               confirmsSelection(range),
               !IsSecureEventInputEnabled() else {
             if range != selection && Self.range(element) == range { _ = setSelection(selection) }
@@ -304,7 +329,7 @@ struct FocusedText {
         item.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
         pasteboard.clearContents()
         guard pasteboard.writeObjects([item]) else {
-            if !savedItems.isEmpty { pasteboard.writeObjects(savedItems) }
+            saved.restore(to: pasteboard, ifUnchangedSince: pasteboard.changeCount)
             if range != selection && Self.range(element) == range { _ = setSelection(selection) }
             return false
         }
@@ -347,10 +372,7 @@ struct FocusedText {
             }
 
             Self.pasteInProgress = false
-            if pasteboard.changeCount == replacementCount {
-                pasteboard.clearContents()
-                if !savedItems.isEmpty { pasteboard.writeObjects(savedItems) }
-            }
+            saved.restore(to: pasteboard, ifUnchangedSince: replacementCount)
             if aiPaste, confirmed {
                 if Self.range(element) == inserted {
                     _ = setSelection(NSRange(location: NSMaxRange(inserted), length: 0))

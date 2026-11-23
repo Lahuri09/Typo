@@ -2,6 +2,14 @@ import Foundation
 import TypoCore
 
 @MainActor func runSpeechModelChecks(_ expect: (Bool) -> Void) throws {
+    let started = ContinuousClock.now
+    let countdown = RecordingCountdown(startedAt: started)
+    expect(countdown.deadline == started.advanced(by: .seconds(120)))
+    expect(countdown.reading(at: started) == .init(seconds: 120, isWarning: false))
+    expect(countdown.reading(at: started.advanced(by: .seconds(108))) == .init(seconds: 12, isWarning: false))
+    expect(countdown.reading(at: started.advanced(by: .milliseconds(108_001))) == .init(seconds: 12, isWarning: true))
+    expect(countdown.reading(at: started.advanced(by: .seconds(109))) == .init(seconds: 11, isWarning: true))
+    expect(countdown.reading(at: countdown.deadline.advanced(by: .seconds(2))) == .init(seconds: 0, isWarning: true))
     let custom = SpeechModelProvider.compatible
     let endpoint = try custom.endpoint(baseURL: "https://EXAMPLE.org:443/v1/")
     let complete = try custom.endpoint(baseURL: "https://example.org/v1/audio/transcriptions")
@@ -24,6 +32,14 @@ import TypoCore
     expect(standardBody.contains("name=\"languages[]\"\r\n\r\nru\r\n"))
     expect(standardBody.contains("name=\"file\"; filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\n"))
     expect(standard.httpBody?.range(of: audio) != nil)
+    let wavTooLarge = Data(repeating: 0, count: SpeechModelRequest.maxAudioBytes + 1)
+    do {
+        _ = try SpeechModelRequest.transcription(wavTooLarge, language: "ru", provider: .openAI,
+                                                 endpoint: direct, model: "gpt-transcribe", key: "test-key")
+        expect(false)
+    } catch let error as SpeechModelError {
+        expect(error == .audioTooLarge)
+    }
     let compatible = try SpeechModelRequest.transcription(audio, language: "en", provider: custom,
                                                           endpoint: endpoint, model: "custom-stt", key: "test-key")
     expect(String(decoding: compatible.httpBody ?? Data(), as: UTF8.self)

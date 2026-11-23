@@ -57,11 +57,12 @@ final class CloudEditor {
                                    configuration: configuration)
     }
 
-    static func rewrite(_ text: String, instruction: String, configuration: Configuration) async throws -> String {
+    static func rewrite(_ text: String, instruction: String, configuration: Configuration, revision: EditRevision? = nil,
+                        session: URLSession = CloudEditor.session) async throws -> String {
         let profile = configuration.profile
         let request = try CloudEditorRequest.rewrite(text, instruction: instruction, provider: profile.provider,
                                                       baseURL: profile.baseURL, model: profile.model,
-                                                      key: configuration.key)
+                                                      key: configuration.key, revision: revision)
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: request)

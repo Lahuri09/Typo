@@ -17,6 +17,13 @@ public struct PanelPosition: Equatable, Sendable {
                   vertical: roomY > 0 ? (bounds.maxY - center.y - size.height / 2) / roomY : 0.5)
     }
 
+    public static func floatingBounds(in activityBounds: CGRect, screenBottom: CGFloat, shadow: CGFloat) -> CGRect {
+        // The window's shadow may extend past the display while the controls stay inside it.
+        let bottom = min(activityBounds.minY, screenBottom + 2 - shadow)
+        return CGRect(x: activityBounds.minX, y: bottom, width: activityBounds.width,
+                      height: activityBounds.maxY - bottom)
+    }
+
     public func windowFrame(size: CGSize, in bounds: CGRect, avoiding obstacle: CGRect? = nil) -> CGRect {
         let width = min(size.width, bounds.width)
         let height = min(size.height, bounds.height)

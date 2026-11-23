@@ -41,7 +41,7 @@ public enum EditPreset: String, CaseIterable, Sendable {
         }
     }
 
-    public func instruction(custom: String, source: String = "") -> String {
+    public func instruction(custom: String, source: String = "", shortening: ShorteningStrength = .gentle) -> String {
         if self == .custom { return custom }
         if Self.isMostlyCyrillic(source) {
             let action = switch self {
@@ -52,9 +52,11 @@ public enum EditPreset: String, CaseIterable, Sendable {
             case .spelling:
                 "Исправь опечатки внутри слов. Не подбирай синонимы. Сохрани знаки препинания, пробелы, регистр и порядок слов. Пример: «Я севодня дома.» → «Я сегодня дома.»."
             case .concise:
-                "Сделай текст заметно короче. Сохрани факты, сроки, просьбы и степень уверенности автора. Пример: «Короче, я просто хотел сказать, что отчёт нужен к пятнице, желательно до 14:00. Если не успеешь, предупреди меня заранее.» → «Отчёт нужен к пятнице, желательно до 14:00. Если не успеешь, предупреди заранее.»"
+                shortening.instruction(russian: true)
             case .business:
-                "Перепиши исходник в деловом стиле для рабочего чата. Замени все грубые слова, мат и жаргон нейтральными выражениями. Сохрани просьбу, день и время. Примеры: «Я заебался её чинить» → «Я устал постоянно её исправлять». «Скинь ссылку» → «Пожалуйста, пришлите ссылку»."
+                """
+                Перепиши исходник вежливо для рабочего чата. Убери мат, резкость и жаргон, в том числе в цитатах и словах со звёздочками. Сохрани каждый факт, число, срок, просьбу и отрицание. Не меняй, кто что сделал и что нужно сделать. Исправь ошибки и верни только отредактированный текст.
+                """
             case .conversational:
                 "Перепиши просто и разговорно. Сохрани смысл, факты, сроки и просьбы."
             case .custom:
@@ -70,9 +72,11 @@ public enum EditPreset: String, CaseIterable, Sendable {
         case .spelling:
             "Fix obvious misspellings inside words only. Preserve punctuation, whitespace, word count, word order and capitalization. Leave words that are already correctly spelled untouched."
         case .concise:
-            "Shorten by removing filler and repetition. Keep all essential ideas, facts, and requests. Keep the author's tone."
+            shortening.instruction(russian: false)
         case .business:
-            "Rewrite in a clear, concise professional tone. Replace all profanity and slang with neutral wording. Keep facts, names and intent intact."
+            """
+            Rewrite this as a polite professional message. Rephrase every instance of swearing, insults and coarse slang, including quotations and words masked with symbols. Remove expletive interjections. Preserve facts, names, dates, times, requests and negation.
+            """
         case .conversational:
             "Rewrite in a clear, natural conversational tone. Keep facts, names and intent intact."
         case .custom:
@@ -84,6 +88,8 @@ public enum EditPreset: String, CaseIterable, Sendable {
         guard self == .custom || (Self.isMostlyCyrillic(source) == Self.isMostlyCyrillic(output)
             && source.split { !$0.isNumber } == output.split { !$0.isNumber }) else { return false }
         return switch self {
+        case .proofread:
+            Self.preservesProofreadingStructure(source: source, output: output)
         case .punctuation:
             source.split { $0.isWhitespace || $0.isPunctuation }
                 == output.split { $0.isWhitespace || $0.isPunctuation }
@@ -96,29 +102,66 @@ public enum EditPreset: String, CaseIterable, Sendable {
         case .concise:
             output.count < source.count
         case .business:
-            output.range(of: Self.profanityPattern, options: .regularExpression) == nil
+            !Self.containsProfanity(output)
         default:
             true
         }
     }
 
+    private static func preservesProofreadingStructure(source: String, output: String) -> Bool {
+        let originalLines = source.split(whereSeparator: \.isNewline).filter { !$0.allSatisfy(\.isWhitespace) }
+        let editedLines = output.split(whereSeparator: \.isNewline).filter { !$0.allSatisfy(\.isWhitespace) }
+        return originalLines.count == editedLines.count && zip(originalLines, editedLines).allSatisfy { original, edited in
+            let originalWords = original.split(whereSeparator: \.isWhitespace).count
+            let editedWords = edited.split(whereSeparator: \.isWhitespace).count
+            return originalWords - editedWords <= max(1, originalWords / 10)
+        }
+    }
+
     private static let profanityPattern = #"""
-    (?ix)\b(?:
-        (?:на|по|ни|до|за|про|о)?ху[йяеё]\p{L}*
-        |(?:за|про|на|вы|от|по|об|под|раз|у)?[ьеё]б[ауёлн]\p{L}*
-        |пизд\p{L}*|бля(?:дь|ть|дск\p{L}*)?
-        |(?:motherfuck|fuck|bullshit|shit|asshole)\p{L}*
+    (?ix)
+    (?:^|[.!?]\s+)\s*блин\s*[,!]
+    |\b(?:
+        (?:какого|какой|каким|ни|до)\s+хрен\p{L}*
+        |(?:на|по|ни|до|за|про|о|от)?ху[йяеёию]\p{L}*
+        |(?:за|про|на|вы|от|по|об|под|раз|у|с)?[ъь]?[её]б[ауыёелн]\p{L}*
+        |(?:за|про|на|вы|от|по|об|под|раз|у|с)?[ъь]?[её]б[\p{P}\p{S}]{1,2}[а-яё]+
+        |пизд\p{L}*|бля(?:дь|ть|дск\p{L}*)?|бл[\p{S}*](?:ть|дь)|сука|суки
+        |хреново|хрень|дерьм\p{L}*|облажа\p{L}*|сран\p{L}*
+        |(?:motherfuck|fuck|bullshit|shit|asshole|goddamn)\p{L}*
     )\b
     """#
 
+    public static func containsProfanity(_ text: String) -> Bool {
+        text.range(of: profanityPattern, options: .regularExpression) != nil
+    }
+
+    public static func neutralizingBusinessExpressions(in text: String) -> String {
+        let substitutions: [(String, String)] = [
+            (#"(?im)^([ \t]*)блин[ \t]*[,!][ \t]*"#, "$1"),
+            (#"(?i),[ \t]*(?:блять|блядь|сука)[ \t]*(?=[.!?])"#, ""),
+            (#"(?i)\b(это)([ \t]+будет)?[ \t]+пиздец\b"#, "$1$2 серьёзная проблема"),
+            (#"(?i)\b[её]бан(?:ый|ая|ое|ые|ого|ой|ому|ую|ым|ыми|ых|ом)\b[ \t]+"#, ""),
+            (#"(?i)\b(вс[её])[ \t]+про[её]бали\b"#, "$1 сделали неправильно"),
+            (#"(?im)^([ \t]*)нахуй[ \t]+(эти|такие)\b"#, "$1Не нужны $2")
+        ]
+        let neutral = substitutions.reduce(text) { text, substitution in
+            text.replacingOccurrences(of: substitution.0, with: substitution.1, options: .regularExpression)
+        }
+        guard neutral != text, let first = neutral.first, first.isLowercase,
+              text.first?.isUppercase == true else { return neutral }
+        return first.uppercased() + neutral.dropFirst()
+    }
+
     public func removingFiller(from source: String) -> String {
         guard self == .concise else { return source }
-        let shortened = source.replacingOccurrences(
-            of: #"^(?:(?:ну,?\s+)?короче,\s+)?(?:(?:я\s+)?(?:просто\s+)?хотел[аи]?\s+сказать,\s+что\s+)?"#,
-            with: "", options: [.regularExpression, .caseInsensitive])
-        guard shortened != source, let first = shortened.first,
-              first.isLetter else { return source }
-        return first.uppercased() + shortened.dropFirst()
+        return source.components(separatedBy: "\n").map { line in
+            let shortened = line.replacingOccurrences(
+                of: #"^(?:(?:ну,?\s+)?короче,\s+)?(?:(?:на данный момент\s+)?(?:я\s+)?(?:просто\s+)?хотел[аи]?(?:\s+бы)?\s+(?:сказать|уточнить),\s+что\s+)?"#,
+                with: "", options: [.regularExpression, .caseInsensitive])
+            guard shortened != line, let first = shortened.first, first.isLetter else { return line }
+            return first.uppercased() + shortened.dropFirst()
+        }.joined(separator: "\n")
     }
 
     public func fixingBasicPunctuation(in source: String) -> String {

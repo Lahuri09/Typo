@@ -14,6 +14,22 @@ import TypoCore
 
 @main
 struct TestRunner {
+    @MainActor static func validatesDictationHistory() {
+        let suite = "local.typo.tests.dictation." + UUID().uuidString
+        guard let defaults = UserDefaults(suiteName: suite) else { preconditionFailure("Could not open test defaults") }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let history = DictationHistory(defaults: defaults)
+        history.add(" \n ")
+        expect(history.entries.isEmpty)
+        let body = String(repeating: "Текст диктовки с паузой и эмодзи 🎙️.\n", count: 1_500)
+        for number in 0...DictationHistory.limit { history.add("Запись \(number)\n\(body)") }
+        let restored = DictationHistory(defaults: defaults)
+        expect(restored.entries.count == DictationHistory.limit)
+        expect(restored.entries.map(\.text) == (1...DictationHistory.limit).reversed().map { "Запись \($0)\n\(body)" })
+        if let first = restored.entries.first { restored.remove(first.id) }
+        expect(DictationHistory(defaults: defaults).entries.count == DictationHistory.limit - 1)
+    }
+
     static func main() throws {
         convertsCaseAndPunctuation()
         automaticChecksBothLanguages()
@@ -63,6 +79,7 @@ struct TestRunner {
         try runCloudEditorChecks { expect($0) }
         try runSpeechModelChecks { expect($0) }
         runEditActionChecks { expect($0) }
+        validatesDictationHistory()
         let panelBounds = CGRect(x: -900, y: 28, width: 800, height: 620)
         let panelSize = CGSize(width: 300, height: 84)
         let position = PanelPosition(horizontal: 0.25, vertical: 0.75)
@@ -78,6 +95,11 @@ struct TestRunner {
         let wide = position.windowFrame(size: CGSize(width: 900, height: 900), in: panelBounds,
                                         avoiding: CGRect(x: -225, y: 28, width: 125, height: 100))
         expect(wide == CGRect(x: -900, y: 132, width: 800, height: 516))
+        let floating = PanelPosition.floatingBounds(in: panelBounds, screenBottom: -12, shadow: 14)
+        let atBottom = PanelPosition(horizontal: 1, vertical: 1).windowFrame(size: panelSize, in: floating)
+        expect(atBottom.minY + 14 == -10 && floating.maxY == panelBounds.maxY)
+        expect(PanelPosition(center: CGPoint(x: atBottom.midX, y: atBottom.midY), size: panelSize, in: floating)
+            == PanelPosition(horizontal: 1, vertical: 1))
         expect(EditPreset.chooserActions.prefix(2).elementsEqual([.proofread, .concise]))
         expect(!EditPreset.chooserActions.contains(.punctuation) && !EditPreset.chooserActions.contains(.spelling))
         expect(EditPreset.punctuation.accepts("Привет, как дела?", replacing: "Привет как дела"))
@@ -91,7 +113,22 @@ struct TestRunner {
         expect(!EditPreset.business.accepts("Отчёт, блядь, нужен к 16:00.", replacing: "Скинь отчёт к 16:00."))
         expect(!EditPreset.business.accepts("Я заебался переделывать отчёт.", replacing: "Я устал переделывать отчёт."))
         expect(!EditPreset.business.accepts("Fix the fucking form.", replacing: "Fix the form."))
+        expect(!EditPreset.business.accepts("Какого хрена проверку отложили?", replacing: "Почему проверку отложили?"))
+        expect(!EditPreset.business.accepts("Почему вы, сука, отложили проверку?", replacing: "Почему вы отложили проверку?"))
+        expect(!EditPreset.business.accepts("Скинь этот еб*ный отчёт.", replacing: "Пришлите этот отчёт."))
+        expect(!EditPreset.business.accepts("This is a shitshow.", replacing: "This is a problem."))
         expect(EditPreset.business.accepts("Подстрахуй меня и отправь отчёт.", replacing: "Помоги отправить отчёт."))
+        expect(EditPreset.business.accepts("Рецепт соуса из хрена. Сложите блин пополам.", replacing: "Рецепт соуса из хрена. Сложите блин пополам."))
+        expect(EditPreset.neutralizingBusinessExpressions(in: "Блин, опять сломалась сборка, блять. Это проблема.")
+                == "Опять сломалась сборка. Это проблема.")
+        expect(EditPreset.neutralizingBusinessExpressions(in: "Отправь ебаный отчёт, иначе это будет пиздец.")
+                == "Отправь отчёт, иначе это будет серьёзная проблема.")
+        expect(EditPreset.neutralizingBusinessExpressions(in: "На завтрак подали блин, чай и варенье.")
+                == "На завтрак подали блин, чай и варенье.")
+        expect(EditPreset.neutralizingBusinessExpressions(in: "Мы опять всё проебали.")
+                == "Мы опять всё сделали неправильно.")
+        expect(EditPreset.neutralizingBusinessExpressions(in: "Нахуй эти правки, но заявку нужно закрыть.")
+                == "Не нужны эти правки, но заявку нужно закрыть.")
         expect(!EditPreset.concise.accepts("Отчёт до 17:00.", replacing: "Отправь отчёт до 14:00."))
         expect(EditPreset.concise.removingFiller(from: "Короче, я просто хотел сказать, что отчёт нужен завтра.")
                == "Отчёт нужен завтра.")
@@ -99,6 +136,11 @@ struct TestRunner {
                == "Я хотел предупредить, что отчёт нужен завтра.")
         expect(EditPreset.proofread.fixingBasicPunctuation(in: "мы получили письмо но не ответили")
                == "мы получили письмо, но не ответили")
+        let proofreadSource = "севодня мы получили письмо\n\nтретий раздел остался на проверке."
+        expect(EditPreset.proofread.accepts("Сегодня мы получили письмо.\n\nТретий раздел остался на проверке.",
+                                            replacing: proofreadSource))
+        expect(!EditPreset.proofread.accepts("Сегодня мы получили письмо.", replacing: proofreadSource))
+        expect(!EditPreset.proofread.accepts("Сегодня.\n\nТретий раздел остался на проверке.", replacing: proofreadSource))
         expect(EditPreset.custom.accepts("Send the report.", replacing: "Пришли отчёт."))
         expect(EditPreset.custom.instruction(custom: "Моя инструкция") == "Моя инструкция")
         expect(AIRequest.cleanTranscript("  [BLANK_AUDIO]\n") == "")
@@ -274,6 +316,14 @@ struct TestRunner {
     expect(body?["think"] as? Bool == false)
     let input = try JSONDecoder().decode([String: String].self, from: Data((messages?.last?["content"] ?? "").utf8))
     expect(input["source"] == text)
+    let alternate = try AIRequest.rewrite(text, instruction: "Перепиши", endpoint: endpoint,
+                                          revision: EditRevision(previous: "Первый вариант", clarification: nil))
+    let alternateBody = try JSONSerialization.jsonObject(with: alternate.httpBody!) as? [String: Any]
+    let alternateMessages = alternateBody?["messages"] as? [[String: String]]
+    let alternatePayload = try JSONDecoder().decode([String: String].self,
+        from: Data((alternateMessages?.last?["content"] ?? "").utf8))
+    expect(alternatePayload == ["source": text, "previous": "Первый вариант"])
+    expect((alternateBody?["options"] as? [String: Double])?["temperature"] == 0.25)
     expect(AIRequest.isConversationalRefusal("Я не могу продолжить разговор.", source: "Сократи меня."))
     expect(!AIRequest.isConversationalRefusal("Я не могу прийти.", source: "Я не могу прийти сегодня."))
     expect(!EditPreset.concise.accepts("Привет, как у тебя дела?", replacing: "Привет, как дела?"))
@@ -282,4 +332,6 @@ struct TestRunner {
     let empty = try AIRequest.result(from: Data(#"{"message":{"content":"{\"edited\":\"   \"}"}}"#.utf8))
     expect(rewritten == "Исправлено")
     expect(empty.isEmpty)
+    let capped = Data(#"{"done_reason":"length","message":{"content":"{\"edited\":\"Начало текста.\"}"}}"#.utf8)
+    expect((try? AIRequest.result(from: capped)) == nil)
 }

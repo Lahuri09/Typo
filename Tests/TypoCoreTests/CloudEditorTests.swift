@@ -46,6 +46,21 @@ import TypoCore
     expect((try? CloudEditorRequest.rewrite(source, instruction: "Edit", provider: .openAI, baseURL: "",
                                             model: "test", key: "fake\nextra")) == nil)
 
+    let refinement = EditRevision(previous: "Первый вариант", clarification: "Сохрани сроки 🙂")
+    let revised = try CloudEditorRequest.rewrite(source, instruction: "Вычитай", provider: .openAI,
+        baseURL: "", model: CloudEditorProvider.openAI.defaultModel, key: "test-key", revision: refinement)
+    if let body = revised.httpBody,
+       let object = try JSONSerialization.jsonObject(with: body) as? [String: Any],
+       let messages = object["messages"] as? [[String: String]],
+       let user = messages.last?["content"] {
+        let payload = try JSONDecoder().decode([String: String].self, from: Data(user.utf8))
+        expect(payload == ["source": source, "previous": "Первый вариант", "clarification": "Сохрани сроки 🙂"])
+        expect(messages.first?["content"]?.contains("Сохрани сроки") == false)
+        expect(messages.first?["content"]?.contains("JSON field clarification") == true)
+    } else {
+        expect(false)
+    }
+
     let chat = Data(#"{"choices":[{"message":{"content":" Исправлено "},"finish_reason":"stop"}]}"#.utf8)
     let claude = Data(#"{"content":[{"type":"thinking"},{"type":"text","text":"Исправлено"}],"stop_reason":"end_turn"}"#.utf8)
     let truncated = Data(#"{"choices":[{"message":{"content":"Часть"},"finish_reason":"length"}]}"#.utf8)

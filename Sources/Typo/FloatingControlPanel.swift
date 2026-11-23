@@ -10,13 +10,21 @@ final class FloatingControlPanel: NSObject {
     private let canEdit: () -> Bool
     private var panels: [CGDirectDisplayID: OverlayPanel] = [:]
     private var started = false
-    static let contentSize = CGSize(width: 78, height: 42)
+    static let contentSize = CGSize(width: 72, height: 38)
+    static let buttonDiameter: CGFloat = 30
+    static let buttonSpacing: CGFloat = 4
     static let dictationIcon = "waveform"
     static let editIcon = "pencil.line"
 
     static func windowSize(scale: CGFloat) -> CGSize {
-        let rim = PanelChrome.shadowInset * 2
-        return CGSize(width: (contentSize.width + rim) * scale, height: (contentSize.height + rim) * scale)
+        CGSize(width: (contentSize.width + PanelChrome.shadowInset * 2) * scale,
+               height: (contentSize.height + PanelChrome.shadowInset * 2) * scale)
+    }
+
+    static func dragRegion(in bounds: CGRect, scale: CGFloat) -> CGRect {
+        let width = contentSize.width * scale
+        let height = contentSize.height * scale
+        return CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
     }
 
     init(appearance: PanelAppearance, record: @escaping () -> Void, edit: @escaping () -> Void,
@@ -60,32 +68,76 @@ final class FloatingControlPanel: NSObject {
         let size = Self.windowSize(scale: appearance.size.scale)
         let visible = appearance.isPlacingControls || appearance.floatingVisibility == .always
             || (appearance.floatingVisibility == .inText && (appearance.hasTextContext || isRecording()))
-        let screens = visible ? NSScreen.screens : []
+        let screens = NSScreen.screens
         var visiblePanels: [CGDirectDisplayID: OverlayPanel] = [:]
         var visibleFrames: [CGDirectDisplayID: CGRect] = [:]
         for screen in screens {
             guard let id = screen.displayID else { continue }
-            let bounds = screen.panelBounds
+            let bounds = bounds(on: screen)
             guard !bounds.isEmpty else { continue }
-            let window = panels[id] ?? OverlayPanel(size: size, content: FloatingControlsView(
-                appearance: appearance, record: record, edit: edit, isRecording: isRecording, canEdit: canEdit,
-                move: { [weak self] window, origin, finished in self?.move(window, to: origin, finished: finished) }
-            ))
+            guard visible || panels[id] != nil else { continue }
+            let window = panels[id] ?? makePanel(size: size)
             let frame = appearance.controlsPosition.windowFrame(size: size, in: bounds)
             if window.frame != frame { window.setFrame(frame, display: true) }
-            if !window.isVisible || reorder { window.orderFrontRegardless() }
+            window.acceptsGrabClicks = !appearance.isPlacingControls
+            window.setFloatingVisible(visible, reorder: reorder || appearance.isPlacingControls)
             visiblePanels[id] = window
-            visibleFrames[id] = window.frame
+            if visible { visibleFrames[id] = window.frame }
         }
         for (id, panel) in panels where visiblePanels[id] == nil { panel.orderOut(nil) }
         panels = visiblePanels
         if appearance.floatingFrames != visibleFrames { appearance.floatingFrames = visibleFrames }
     }
 
+    private func makePanel(size: CGSize) -> OverlayPanel {
+        let window = OverlayPanel(size: size, content: FloatingControlsView(
+            appearance: appearance, record: record, edit: edit, isRecording: isRecording, canEdit: canEdit
+        ))
+        window.canDragAt = { [weak window, weak self] point in
+            guard let window, let self else { return false }
+            let region = Self.dragRegion(in: CGRect(origin: .zero, size: window.frame.size),
+                                         scale: self.appearance.size.scale)
+            return region.contains(point)
+        }
+        window.onClickAfterGrab = { [weak window, weak self] start, end in
+            guard let window, let self else { return }
+            let bounds = CGRect(origin: .zero, size: window.frame.size)
+            let scale = self.appearance.size.scale
+            guard let action = Self.action(at: start, in: bounds, scale: scale),
+                  action == Self.action(at: end, in: bounds, scale: scale) else { return }
+            if action == .dictation {
+                if self.isRecording() || self.canEdit() { self.record() }
+            } else if self.canEdit() {
+                self.edit()
+            }
+        }
+        window.onDrag = { [weak self] window, origin, finished in
+            self?.move(window, to: origin, finished: finished)
+        }
+        return window
+    }
+
+    private static func action(at point: CGPoint, in bounds: CGRect, scale: CGFloat) -> Action? {
+        let x = (point.x - bounds.midX) / scale
+        let y = (point.y - bounds.midY) / scale
+        let offset = (buttonDiameter + buttonSpacing) / 2
+        let radius = buttonDiameter / 2
+        if hypot(x + offset, y) <= radius { return .dictation }
+        if hypot(x - offset, y) <= radius { return .rewrite }
+        return nil
+    }
+
+    private func bounds(on screen: NSScreen) -> CGRect {
+        PanelPosition.floatingBounds(in: screen.panelBounds, screenBottom: screen.frame.minY + screen.safeAreaInsets.bottom,
+                                     shadow: PanelChrome.shadowInset * appearance.size.scale)
+    }
+
     private func move(_ window: NSWindow, to origin: CGPoint, finished: Bool) {
         let pointer = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { $0.frame.contains(pointer) } ?? window.screen
-        guard let bounds = screen?.panelBounds, !bounds.isEmpty else { return }
+        guard let screen else { return }
+        let bounds = bounds(on: screen)
+        guard !bounds.isEmpty else { return }
         let size = window.frame.size
         let center = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
         let position = PanelPosition(center: center, size: size, in: bounds)
@@ -103,21 +155,17 @@ private struct FloatingControlsView: View {
     let edit: () -> Void
     let isRecording: () -> Bool
     let canEdit: () -> Bool
-    let move: (NSWindow, CGPoint, Bool) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var hovered = false
-    @State private var dragging = false
-    private static let handleSize = CGSize(width: 34, height: 20)
 
-    private var revealsHandle: Bool { hovered || dragging }
-    private var engaged: Bool { revealsHandle || appearance.isPlacingControls || isRecording() || !canEdit() }
+    private var engaged: Bool { hovered || appearance.isPlacingControls || isRecording() || !canEdit() }
 
     var body: some View {
         let recording = isRecording()
         let editingAvailable = canEdit()
         let theme = appearance.palette
-        HStack(spacing: 4) {
+        HStack(spacing: FloatingControlPanel.buttonSpacing) {
             control(recording ? "stop.fill" : FloatingControlPanel.dictationIcon,
                     label: recording ? "Закончить и распознать" : "Начать диктовку",
                     active: recording, action: record)
@@ -127,29 +175,12 @@ private struct FloatingControlsView: View {
         }
         .frame(width: FloatingControlPanel.contentSize.width, height: FloatingControlPanel.contentSize.height)
         .modifier(PanelChrome(theme: theme, cornerRadius: 21, usesGradient: appearance.usesGradient))
-        .opacity(reduceTransparency || engaged ? 1 : 0.70)
-        .overlay(alignment: .top) {
-            Image(systemName: "ellipsis")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(theme.ink)
-                .frame(width: 28, height: 13)
-                .background(theme.backdrop, in: Capsule())
-                .overlay { Capsule().strokeBorder(theme.ink.opacity(0.22), lineWidth: 1) }
-                .frame(width: Self.handleSize.width, height: Self.handleSize.height)
-                .opacity(revealsHandle ? 1 : 0)
-                .allowsHitTesting(false)
-                .accessibilityHidden(!revealsHandle)
-                .accessibilityLabel("Перетащить панель")
-                .help("Перетащить панель")
-                .offset(y: -11)
-        }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: engaged)
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.14), value: revealsHandle)
+        .opacity(reduceTransparency || engaged ? 1 : appearance.restingOpacity)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.19), value: engaged)
         .scaleEffect(appearance.size.scale)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .overlay {
-            FloatingDragHandle(size: Self.handleSize, scale: appearance.size.scale, isVisible: revealsHandle, move: move,
-                               onHover: { hovered = $0 }, onDragState: { dragging = $0 })
+            FloatingHoverTracking(scale: appearance.size.scale, onHover: { hovered = $0 })
                 .accessibilityHidden(true)
         }
         .accessibilityElement(children: .contain)
@@ -161,7 +192,7 @@ private struct FloatingControlsView: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 13, weight: .semibold))
-                .frame(width: 32, height: 32)
+                .frame(width: FloatingControlPanel.buttonDiameter, height: FloatingControlPanel.buttonDiameter)
                 .contentShape(Circle())
         }
         .buttonStyle(ControlButtonStyle(theme: appearance.palette, active: active))
@@ -174,58 +205,45 @@ private struct ControlButtonStyle: ButtonStyle {
     let theme: PanelPalette
     let active: Bool
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovered = false
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .foregroundStyle(active ? theme.backdrop : theme.accent)
-            .background(active ? theme.accent : theme.ink.opacity(configuration.isPressed ? 0.18 : 0.08),
+            .background(active ? theme.accent : theme.ink.opacity(configuration.isPressed ? 0.20 : hovered ? 0.15 : 0.08),
                         in: Circle())
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.95 : 1)
             .opacity(isEnabled ? 1 : 0.38)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovered)
+            .onHover { hovered = isEnabled && $0 }
     }
 }
 
-private struct FloatingDragHandle: NSViewRepresentable {
-    let size: CGSize
+private struct FloatingHoverTracking: NSViewRepresentable {
     let scale: CGFloat
-    let isVisible: Bool
-    let move: (NSWindow, CGPoint, Bool) -> Void
     let onHover: (Bool) -> Void
-    let onDragState: (Bool) -> Void
 
-    func makeNSView(context: Context) -> Handle { Handle() }
-    func updateNSView(_ view: Handle, context: Context) {
-        view.gripSize = CGSize(width: size.width * scale, height: size.height * scale)
-        view.gripCenterOffset = (FloatingControlPanel.contentSize.height / 2 + 1) * scale
-        view.gripIsVisible = isVisible
-        view.move = move
+    func makeNSView(context: Context) -> TrackingView { TrackingView() }
+
+    func updateNSView(_ view: TrackingView, context: Context) {
         view.onHover = onHover
-        view.onDragState = onDragState
-        view.window?.invalidateCursorRects(for: view)
+        if view.scale != scale {
+            view.scale = scale
+            view.updateTrackingAreas()
+        }
     }
 
-    final class Handle: NSView {
-        var move: ((NSWindow, CGPoint, Bool) -> Void)?
+    final class TrackingView: NSView {
         var onHover: ((Bool) -> Void)?
-        var onDragState: ((Bool) -> Void)?
-        var gripSize: CGSize = .zero
-        var gripCenterOffset: CGFloat = 0
-        var gripIsVisible = false
+        var scale: CGFloat = 1
         private var hoverArea: NSTrackingArea?
-        private var anchor: CGPoint?
-        private var didMove = false
-
-        private var grip: CGRect {
-            CGRect(x: bounds.midX - gripSize.width / 2, y: bounds.midY + gripCenterOffset - gripSize.height / 2,
-                   width: gripSize.width, height: gripSize.height)
-        }
-
-        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
         override func updateTrackingAreas() {
             super.updateTrackingAreas()
             if let hoverArea { removeTrackingArea(hoverArea) }
-            // The panel never becomes key, so its tracking area must stay active over other apps.
-            let area = NSTrackingArea(rect: .zero, options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect],
+            let region = FloatingControlPanel.dragRegion(in: bounds, scale: scale)
+            let area = NSTrackingArea(rect: region, options: [.activeAlways, .mouseEnteredAndExited],
                                       owner: self, userInfo: nil)
             addTrackingArea(area)
             hoverArea = area
@@ -233,41 +251,6 @@ private struct FloatingDragHandle: NSViewRepresentable {
 
         override func mouseEntered(with event: NSEvent) { onHover?(true) }
         override func mouseExited(with event: NSEvent) { onHover?(false) }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            gripIsVisible && grip.contains(convert(point, from: superview)) ? self : nil
-        }
-
-        override func resetCursorRects() {
-            if gripIsVisible { addCursorRect(grip, cursor: .openHand) }
-        }
-
-        override func mouseDown(with event: NSEvent) {
-            guard let window else { return }
-            let pointer = NSEvent.mouseLocation
-            anchor = CGPoint(x: pointer.x - window.frame.minX, y: pointer.y - window.frame.minY)
-            didMove = false
-            onDragState?(true)
-            NSCursor.closedHand.set()
-        }
-
-        override func mouseDragged(with event: NSEvent) {
-            didMove = true
-            update(finished: false)
-        }
-
-        override func mouseUp(with event: NSEvent) {
-            guard anchor != nil else { return }
-            if didMove { update(finished: true) }
-            anchor = nil
-            onDragState?(false)
-            NSCursor.openHand.set()
-        }
-
-        private func update(finished: Bool) {
-            guard let anchor, let window else { return }
-            let pointer = NSEvent.mouseLocation
-            move?(window, CGPoint(x: pointer.x - anchor.x, y: pointer.y - anchor.y), finished)
-        }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }

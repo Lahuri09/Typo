@@ -8,59 +8,77 @@ struct PanelAppearanceSettings: View {
     @State private var display = PreviewDisplay.current
     @State private var replay: Replay?
     @State private var status: ActivityStatus?
+    @State private var countdown: RecordingCountdown?
     @State private var draft = ""
     @State private var draftSelected = false
     @State private var coordinatesExpanded = false
     @GestureState private var panelDrag: PreviewDrag?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Предпросмотр").font(.headline)
-                Spacer()
-                Button { replay = Replay(mode: .dictation) } label: {
-                    Label("Диктовка", systemImage: FloatingControlPanel.dictationIcon)
-                }
-                .help("Проиграть пример диктовки")
-                Button { replay = Replay(mode: .editing) } label: {
-                    Label("Редактура", systemImage: FloatingControlPanel.editIcon)
-                }
-                .help("Проиграть пример редактуры")
-            }
-            VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 16) {
+            appearanceGroup("Предпросмотр", icon: "macwindow") {
                 desktopPreview
-                    .frame(height: min(310, 640 * display.frame.height / display.frame.width))
+                    .frame(height: 244)
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Предпросмотр рабочего стола")
                     .accessibilityValue(status?.label ?? "Положение панелей")
-                Text("Наведите на плавающую панель и потяните за три точки сверху.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button { replay = Replay(mode: .dictation) } label: {
+                        Label("Диктовка", systemImage: FloatingControlPanel.dictationIcon)
+                    }
+                    .help("Проиграть пример диктовки")
+                    Button { replay = Replay(mode: .editing) } label: {
+                        Label("Редактура", systemImage: FloatingControlPanel.editIcon)
+                    }
+                    .help("Проиграть пример редактуры")
+                    Spacer()
+                    Text("Положение можно менять на макете")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-            styleControls
-            Divider()
-            HStack(spacing: 10) {
-                Picker("Плавающая панель", selection: $appearance.floatingVisibility) {
+            appearanceGroup("Оформление панелей", icon: "paintpalette") {
+                styleControls
+                Divider()
+                Toggle("Градиент", isOn: $appearance.usesGradient)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+            }
+            appearanceGroup("Плавающая панель", icon: "rectangle.bottomthird.inset.filled") {
+                Picker("Показывать", selection: $appearance.floatingVisibility) {
                     ForEach(FloatingVisibility.allCases) { mode in Text(mode.title).tag(mode) }
                 }
-                Spacer()
+                .pickerStyle(.menu)
+                HStack(spacing: 12) {
+                    Slider(value: $appearance.restingOpacity, in: 0.25...1, step: 0.05) {
+                        Text("Непрозрачность в покое")
+                    }
+                    Text(appearance.restingOpacity.formatted(.percent.precision(.fractionLength(0))))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .frame(width: 34, alignment: .trailing)
+                        .accessibilityHidden(true)
+                }
+                Divider()
                 Button(appearance.isPlacingControls ? "Готово" : "Переместить на экране") {
                     appearance.isPlacingControls.toggle()
                 }
+                Text(appearance.isPlacingControls ? "Перетащите панель на новое место." : "Зажмите панель в любом месте и перетащите её.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            HStack(spacing: 10) {
-                placementMenu("Панель активности", position: $appearance.hudPosition)
-                placementMenu("Плавающая панель", position: $appearance.controlsPosition)
-                Spacer()
-                Toggle("Градиент панелей", isOn: $appearance.usesGradient)
-                    .toggleStyle(.checkbox)
-            }
-            DisclosureGroup("Точная настройка положения", isExpanded: $coordinatesExpanded) {
-                VStack(alignment: .leading, spacing: 12) {
-                    coordinateControls("Панель активности", position: $appearance.hudPosition)
-                    coordinateControls("Плавающая панель", position: $appearance.controlsPosition)
+            appearanceGroup("Положение на экране", icon: "rectangle.dashed") {
+                HStack {
+                    placementMenu("Панель активности", position: $appearance.hudPosition)
+                    placementMenu("Плавающая панель", position: $appearance.controlsPosition)
                 }
-                .padding(.top, 12)
+                DisclosureGroup("Точные координаты", isExpanded: $coordinatesExpanded) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        coordinateControls("Панель активности", position: $appearance.hudPosition)
+                        coordinateControls("Плавающая панель", position: $appearance.controlsPosition)
+                    }
+                    .padding(.top, 8)
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
@@ -75,6 +93,7 @@ struct PanelAppearanceSettings: View {
         .task(id: replay) {
             if let replay { await play(replay.mode) }
         }
+        .onExitCommand { appearance.isPlacingControls = false }
         .onDisappear {
             replay = nil
             status = nil
@@ -85,25 +104,41 @@ struct PanelAppearanceSettings: View {
 
     private var showsFloatingPreview: Bool { appearance.floatingVisibility != .hidden || appearance.isPlacingControls }
 
+    private func appearanceGroup<Content: View>(_ title: String, icon: String,
+                                                @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .accessibilityAddTraits(.isHeader)
+            content()
+        }
+        .padding(15)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 13))
+        .overlay { RoundedRectangle(cornerRadius: 13).strokeBorder(.primary.opacity(0.07)).allowsHitTesting(false) }
+    }
+
     private var styleControls: some View {
-        HStack(alignment: .top, spacing: 24) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Цвет").font(.subheadline.weight(.medium))
-                HStack(spacing: 3) {
-                    ForEach(PanelTheme.allCases.filter { $0 != .custom }, id: \.self) { theme in
-                        swatch(theme)
-                    }
-                    ColorPicker("Свой цвет", selection: $appearance.colorSelection, supportsOpacity: false)
-                        .labelsHidden()
-                        .help("Выбрать свой цвет")
-                        .fixedSize()
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 5) {
+                ForEach(PanelTheme.allCases.filter { $0 != .custom }, id: \.self) { theme in
+                    swatch(theme)
                 }
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Цвет панелей")
+                ColorPicker("Свой цвет", selection: $appearance.colorSelection, supportsOpacity: false)
+                    .labelsHidden()
+                    .help("Выбрать свой цвет")
+                    .fixedSize()
+                Text(appearance.theme.title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 3)
             }
-            Spacer(minLength: 0)
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Размер панелей").font(.subheadline.weight(.medium))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Цвет панелей")
+            HStack {
+                Text("Размер")
+                Spacer()
                 Picker("Размер панелей", selection: $appearance.size) {
                     ForEach(PanelSize.allCases, id: \.self) { size in
                         Text(size.title).tag(size)
@@ -211,7 +246,9 @@ struct PanelAppearanceSettings: View {
         let sampleStatus = status ?? .transcribing
         let scale = appearance.size.scale
         let controlsSize = FloatingControlPanel.windowSize(scale: scale)
-        let controlsFrame = appearance.controlsPosition.windowFrame(size: controlsSize, in: display.bounds)
+        let controlsBounds = PanelPosition.floatingBounds(in: display.bounds, screenBottom: display.safeBottom,
+                                                         shadow: PanelChrome.shadowInset * scale)
+        let controlsFrame = appearance.controlsPosition.windowFrame(size: controlsSize, in: controlsBounds)
         let hudBase = ActivityHUD.windowSize(for: sampleStatus, scale: 1, chooserHeight: PreviewActivity.chooserHeight)
         let hudScale = min(scale, display.bounds.width / hudBase.width)
         let hudSize = ActivityHUD.windowSize(for: sampleStatus, scale: hudScale, chooserHeight: PreviewActivity.chooserHeight)
@@ -224,7 +261,7 @@ struct PanelAppearanceSettings: View {
         return ZStack {
             DemoDesktop(draft: draft, draftSelected: draftSelected, display: display)
             PreviewActivity(status: sampleStatus, isSample: status == nil, theme: appearance.palette,
-                            usesGradient: appearance.usesGradient)
+                            usesGradient: appearance.usesGradient, countdown: countdown)
                 .scaleEffect(hudScale * projection.scale)
                 .opacity(status == nil ? 0.72 : 1)
                 .id(status == nil)
@@ -235,7 +272,8 @@ struct PanelAppearanceSettings: View {
                 PreviewFloatingControls(theme: appearance.palette, recording: status == .recording,
                                         usesGradient: appearance.usesGradient)
                     .scaleEffect(scale * projection.scale)
-                    .position(projection.center(of: controls, movedBy: controlsOffset))
+                    .opacity(appearance.restingOpacity)
+                    .position(projection.center(of: controls, movedBy: controlsOffset, in: controlsBounds))
                     .allowsHitTesting(false)
             }
         }
@@ -250,8 +288,9 @@ struct PanelAppearanceSettings: View {
                 guard let drag = previewDrag(value, hud: hud, controls: controls) else { return }
                 let frame = drag.controls ? controls : hud
                 let window = drag.controls ? controlsFrame : hudFrame
-                let center = projection.center(of: frame, movedBy: drag.translation)
-                let position = projection.position(for: center, window: window)
+                let bounds = drag.controls ? controlsBounds : display.bounds
+                let center = projection.center(of: frame, movedBy: drag.translation, in: bounds)
+                let position = projection.position(for: center, window: window, in: bounds)
                 if drag.controls { appearance.controlsPosition = position }
                 else { appearance.hudPosition = position }
             })
@@ -290,9 +329,13 @@ struct PanelAppearanceSettings: View {
     private func play(_ mode: Replay.Mode) async {
         draft = mode == .editing ? "давай перенесем встречу на завтра я утром свободен" : ""
         draftSelected = mode == .editing
+        if mode == .dictation {
+            let demoRemaining = RecordingCountdown.warningThreshold + .seconds(1)
+            countdown = RecordingCountdown(startedAt: .now.advanced(by: demoRemaining - RecordingCountdown.limit))
+        }
         updateStatus(mode == .dictation ? .recording : .choosingEdit)
         do {
-            try await Task.sleep(for: .milliseconds(1300))
+            try await Task.sleep(for: .milliseconds(mode == .dictation ? 2600 : 1300))
             updateStatus(mode == .dictation ? .transcribing : .rewriting)
             try await Task.sleep(for: .milliseconds(800))
             draftSelected = false
@@ -310,9 +353,9 @@ struct PanelAppearanceSettings: View {
         } else if next == nil {
             .easeInOut(duration: 0.25)
         } else if status == nil {
-            .spring(duration: 0.36, bounce: 0.17)
+            .spring(duration: 0.42, bounce: 0.08)
         } else {
-            .spring(duration: 0.29, bounce: 0.07)
+            .spring(duration: 0.32, bounce: 0.03)
         }
         withAnimation(animation) { status = next }
     }
@@ -328,14 +371,16 @@ private struct PreviewDisplay: Equatable {
     let frame: CGRect
     let bounds: CGRect
     let visible: CGRect
+    let safeBottom: CGFloat
 
     static var current: Self {
         if let screen = NSApp.keyWindow?.screen ?? NSScreen.underPointer, !screen.panelBounds.isEmpty {
-            return Self(frame: screen.frame, bounds: screen.panelBounds, visible: screen.visibleFrame)
+            return Self(frame: screen.frame, bounds: screen.panelBounds, visible: screen.visibleFrame,
+                        safeBottom: screen.frame.minY + screen.safeAreaInsets.bottom)
         }
         let fallback = CGRect(x: 0, y: 0, width: 1440, height: 900)
         let visible = CGRect(x: 0, y: 58, width: 1440, height: 818)
-        return Self(frame: fallback, bounds: visible.insetBy(dx: 6, dy: 6), visible: visible)
+        return Self(frame: fallback, bounds: visible.insetBy(dx: 6, dy: 6), visible: visible, safeBottom: fallback.minY)
     }
 }
 
@@ -355,17 +400,17 @@ private struct DesktopProjection {
                width: window.width * scale, height: window.height * scale)
     }
 
-    func center(of frame: CGRect, movedBy translation: CGSize) -> CGPoint {
-        let area = self.frame(for: display.bounds)
+    func center(of frame: CGRect, movedBy translation: CGSize, in bounds: CGRect? = nil) -> CGPoint {
+        let area = self.frame(for: bounds ?? display.bounds)
         let insetX = min(area.width, frame.width) / 2
         let insetY = min(area.height, frame.height) / 2
         return CGPoint(x: min(max(frame.midX + translation.width, area.minX + insetX), area.maxX - insetX),
                        y: min(max(frame.midY + translation.height, area.minY + insetY), area.maxY - insetY))
     }
 
-    func position(for center: CGPoint, window: CGRect) -> PanelPosition {
+    func position(for center: CGPoint, window: CGRect, in bounds: CGRect) -> PanelPosition {
         let point = CGPoint(x: display.frame.minX + center.x / scale, y: display.frame.maxY - center.y / scale)
-        return PanelPosition(center: point, size: window.size, in: display.bounds)
+        return PanelPosition(center: point, size: window.size, in: bounds)
     }
 }
 
@@ -541,7 +586,7 @@ private struct PreviewFloatingControls: View {
         Image(systemName: name)
             .font(.system(size: 13, weight: .semibold))
             .foregroundStyle(active ? theme.backdrop : theme.accent)
-            .frame(width: 32, height: 32)
+            .frame(width: 30, height: 30)
             .background(active ? theme.accent : theme.ink.opacity(0.07), in: Circle())
     }
 }
@@ -552,6 +597,7 @@ private struct PreviewActivity: View {
     let isSample: Bool
     let theme: PanelPalette
     let usesGradient: Bool
+    let countdown: RecordingCountdown?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -587,6 +633,9 @@ private struct PreviewActivity: View {
                 .background(theme.ink.opacity(0.09), in: Circle())
             Image(systemName: "mic.fill").font(.system(size: 13, weight: .medium)).foregroundStyle(theme.accent)
             PreviewWave(accent: theme.accent).frame(width: 91, height: 23)
+            if let countdown {
+                RecordingTimer(countdown: countdown, onLightSurface: theme.usesLightSurface)
+            }
             Image(systemName: "arrow.up")
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(theme.backdrop)

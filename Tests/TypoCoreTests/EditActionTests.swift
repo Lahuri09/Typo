@@ -27,4 +27,29 @@ import TypoCore
     expect(reopened.enabledActions.first?.prompt == "Поблагодари.")
     for action in reopened.enabledActions { reopened.setEnabled(false, id: action.id) }
     expect(EditActionCatalog(defaults: defaults).enabledActions.isEmpty)
+
+    let source = "Ольга ждёт отчёт к пятнице.\n\nИвану нужна отдельная сводка."
+    expect(!ShorteningStrength.gentle.accepts("Ольга ждёт отчёт.", replacing: source))
+    expect(ShorteningStrength.gentle.accepts("Ольга ждёт отчёт к пятнице.\n\nИвану нужна сводка.", replacing: source))
+    expect(ShorteningStrength.strong.accepts("Ольге нужен отчёт к пятнице, Ивану — сводка.", replacing: source))
+    expect(!ShorteningStrength.strong.accepts("Ольге нужен отчёт.", replacing: source))
+    let repeated = "Ольге нужен отчёт.\n\nИвану нужна сводка.\n\nОльге нужен отчёт."
+    expect(ShorteningStrength.strong.removingRepeatedParagraphs(in: repeated) == "Ольге нужен отчёт.\n\nИвану нужна сводка.")
+    expect(ShorteningStrength.gentle.removingRepeatedParagraphs(in: repeated) == repeated)
+    expect(ShorteningStrength.gentle.accepts("Отчёт нужен к пятнице.", replacing: "Короче, я просто хотел сказать, что отчёт нужен к пятнице."))
+    let groups = ShorteningStrength.paragraphGroups(in: repeated, limit: 40)
+    expect(groups.count == 2 && groups.allSatisfy { $0.utf16.count <= 40 } && groups.joined(separator: "\n\n") == repeated)
+
+    let before = "До 🌤 Сейчас тест. После."
+    let original = EditRegion(value: before, range: (before as NSString).range(of: "Сейчас тест."))
+    let edited = original.replacing(with: "Проверим 👋🏽.")!
+    expect(edited.value == "До 🌤 Проверим 👋🏽. После.")
+    expect(edited.matches(value: edited.value, selection: edited.range, permitCaret: true))
+    expect(edited.matches(value: edited.value, selection: NSRange(location: NSMaxRange(edited.range), length: 0), permitCaret: true))
+    expect(!edited.matches(value: edited.value, selection: NSRange(location: 0, length: 0), permitCaret: true))
+    expect(!edited.matches(value: edited.value + "!", selection: edited.range, permitCaret: true))
+    expect(!edited.matches(value: edited.value + "\n", selection: edited.range, permitCaret: true))
+    expect(edited.matches(value: edited.value + "\n", selection: edited.range, permitCaret: true,
+                          allowsMissingTerminalLineFeed: true))
+    expect(!original.matches(value: before, selection: NSRange(location: NSMaxRange(original.range), length: 0), permitCaret: false))
 }
