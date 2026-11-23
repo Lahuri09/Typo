@@ -398,6 +398,11 @@ final class AIInput {
         else { hud.hide() }
     }
 
+    func showLayoutException(_ text: String) {
+        guard phase == .idle, hud.status == nil || hud.status?.dismissal != nil else { return }
+        hud.show(.layoutException(text))
+    }
+
     var canDismiss: Bool { phase != .idle || hud.status != nil }
 
     func promptForEditSelection() {
