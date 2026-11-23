@@ -6,9 +6,9 @@
 <p align="center">
   <a href="#установка"><strong>Установка</strong></a>
   · <a href="https://lahuri09.github.io/Typo/">Сайт</a>
-  · <a href="https://github.com/Lahuri09/Typo/releases/tag/v3.1.6">Релиз на GitHub</a>
+  · <a href="https://github.com/Lahuri09/Typo/releases/tag/v3.1.7">Релиз на GitHub</a>
 </p>
-<p align="center">Apple Silicon · macOS 14+ · Публичная бета 3.1.6</p>
+<p align="center">Apple Silicon · macOS 14+ · Публичная бета 3.1.7</p>
 
 <p align="center">
   <img src="docs/images/showcase-overview.png" width="800" alt="Typo AI для macOS. Меню приложения и панель диктовки.">
@@ -110,7 +110,7 @@
 
 ### 1. Из ZIP
 
-1. Скачайте ZIP для Apple Silicon из [публичной беты 3.1.6](https://github.com/Lahuri09/Typo/releases/tag/v3.1.6).
+1. Скачайте ZIP для Apple Silicon из [публичной беты 3.1.7](https://github.com/Lahuri09/Typo/releases/tag/v3.1.7).
 2. Распакуйте архив и перенесите **Typo.app** в **Программы**. Откройте приложение.
 3. Если Typo ещё нужны разрешения, вверху меню появятся карточки «Микрофон» и «Универсальный доступ». Нажмите **Выдать доступ** и подтвердите запрос macOS. После получения обоих разрешений карточки исчезнут.
 
@@ -121,13 +121,13 @@
 Откройте локальный чат Codex на Mac, куда хотите установить Typo. Скопируйте этот запрос.
 
 ```text
-Установи Typo AI 3.1.6 на этом Mac.
+Установи Typo AI 3.1.7 на этом Mac.
 Репозиторий — https://github.com/Lahuri09/Typo
 
 Проверь, что у меня Apple Silicon и macOS 14 или новее.
-Используй локальный ZIP из dist или архив для arm64 из релиза 3.1.6.
+Используй локальный ZIP из dist или архив для arm64 из релиза 3.1.7.
 Если подходящего архива нет, собери приложение по README из доступной
-копии проекта, если её Info.plist указывает версию 3.1.6.
+копии проекта, если её Info.plist указывает версию 3.1.7.
 
 Перенеси Typo.app в «Программы» и проверь, что оно запускается.
 Если macOS запросит универсальный доступ или доступ к микрофону,
