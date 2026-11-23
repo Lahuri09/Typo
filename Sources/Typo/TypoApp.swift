@@ -34,11 +34,13 @@ struct TypoApp {
     }
 }
 
-final class Launcher: NSObject, NSApplicationDelegate {
+final class Launcher: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let engine = InputEngine()
     private let popover = NSPopover()
     private var statusItem: NSStatusItem?
     private var preferencesWindow: NSWindow?
+    private var localPopoverMonitor: Any?
+    private var globalPopoverMonitor: Any?
     private let preferencesRoute = PreferencesRoute()
     private lazy var floating = FloatingControlPanel(
         appearance: engine.ai.panelAppearance,
@@ -66,6 +68,7 @@ final class Launcher: NSObject, NSApplicationDelegate {
         item.button?.setAccessibilityLabel("Typo AI")
         statusItem = item
         popover.behavior = .transient
+        popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: TypoMenuPanel(
             engine: engine,
             runAction: { [weak self] action in self?.runFromPopover(action) },
@@ -95,6 +98,39 @@ final class Launcher: NSObject, NSApplicationDelegate {
             popover.contentSize = size
         }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        monitorPopoverDismissal()
+    }
+
+    private func monitorPopoverDismissal() {
+        stopMonitoringPopoverDismissal()
+        let events: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        localPopoverMonitor = NSEvent.addLocalMonitorForEvents(matching: events) { [weak self] event in
+            guard let self else { return event }
+            let popoverWindow = self.popover.contentViewController?.view.window
+            let statusWindow = self.statusItem?.button?.window
+            if PopoverDismissalPolicy.shouldClose(isGlobalClick: false,
+                                                   isPopoverWindow: event.window === popoverWindow,
+                                                   isStatusItemWindow: event.window === statusWindow) {
+                self.popover.close()
+            }
+            return event
+        }
+        globalPopoverMonitor = NSEvent.addGlobalMonitorForEvents(matching: events) { [weak self] _ in
+            guard PopoverDismissalPolicy.shouldClose(isGlobalClick: true, isPopoverWindow: false,
+                                                      isStatusItemWindow: false) else { return }
+            self?.popover.close()
+        }
+    }
+
+    private func stopMonitoringPopoverDismissal() {
+        if let localPopoverMonitor { NSEvent.removeMonitor(localPopoverMonitor) }
+        if let globalPopoverMonitor { NSEvent.removeMonitor(globalPopoverMonitor) }
+        localPopoverMonitor = nil
+        globalPopoverMonitor = nil
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        stopMonitoringPopoverDismissal()
     }
 
     private func runFromPopover(_ action: Action) {
@@ -138,6 +174,7 @@ final class Launcher: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopMonitoringPopoverDismissal()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         engine.ai.cancelDictation()
         engine.ai.local.stop()
@@ -252,12 +289,12 @@ private struct Preferences: View {
                 Section("Разрешения") { permissions }
             }
 
-            Section("Автоисправление") {
-                Toggle("Исправлять раскладку во время набора", isOn: $engine.automatic)
+            Section("Автосмена раскладки") {
+                Toggle("Менять RU ↔ EN во время набора", isOn: $engine.automatic)
             }
 
-            Section("Слова-исключения") {
-                Text("После трёх отмен автоисправления Typo запомнит исходное слово.")
+            Section("Исключения автосмены") {
+                Text("После трёх отмен Typo запомнит слово или фразу. Можно отменить исправление горячей клавишей либо стереть его и набрать исходный текст заново.")
                     .foregroundStyle(.secondary)
                 ForEach(engine.wordExceptions.words.sorted(), id: \.self) { word in
                     LabeledContent(word) {
