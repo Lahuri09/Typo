@@ -81,6 +81,7 @@ final class InputEngine {
     private var consumedKeys: Set<UInt16> = []
     private var undo: (element: AXUIElement, pid: pid_t, edit: TextEdit,
                        from: TISInputSource?, toID: String?, automatic: Bool)?
+    private var retyping: (element: AXUIElement, pid: pid_t, edit: TextEdit, started: Double, beganTyping: Bool)?
     private let recognizer = LayoutRecognizer(lexicon: .bundled) { word, layout in
         let language = layout == .english ? "en" : "ru"
         let checker = NSSpellChecker.shared
@@ -125,12 +126,14 @@ final class InputEngine {
             tap = nil
             source = nil
             running = false
+            inputLog.notice("Keyboard interception unavailable: Accessibility permission is missing")
             reset()
             return
         }
         if let tap, CFMachPortIsValid(tap) {
             CGEvent.tapEnable(tap: tap, enable: true)
             running = CGEvent.tapIsEnabled(tap: tap)
+            inputLog.notice("Keyboard interception resumed; enabled=\(self.running)")
             return
         }
 
@@ -159,7 +162,7 @@ final class InputEngine {
                                                    unicodeString: &unit)
                     if count == 1, let scalar = Unicode.Scalar(unit) {
                         let character = Character(scalar)
-                        if character.isLetter { letter = character }
+                        if character.isLetter || character == " " { letter = character }
                     }
                 }
                 let typedLetter = letter
@@ -173,6 +176,7 @@ final class InputEngine {
             }, userInfo: Unmanaged.passUnretained(self).toOpaque()
         ), let source = CFMachPortCreateRunLoopSource(nil, tap, 0) else {
             running = false
+            inputLog.error("Keyboard interception could not create an event tap")
             return
         }
         self.tap = tap
@@ -180,6 +184,7 @@ final class InputEngine {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         running = CGEvent.tapIsEnabled(tap: tap)
+        inputLog.notice("Keyboard interception started; enabled=\(self.running)")
         checkFloatingContextSoon()
     }
 
@@ -191,6 +196,7 @@ final class InputEngine {
         consumedKeys.removeAll()
         typedLetters = 0
         undo = nil
+        retyping = nil
     }
 
     private func handle(_ type: CGEventType, key: UInt16, flags: UInt64, repeated: Bool, letter: Character?, at time: Double,
@@ -270,9 +276,20 @@ final class InputEngine {
             contextClick = nil
             checkFloatingContextSoon()
         }
+        let completedWord = letter == " " && typedLetters > 0
         if action == nil {
             matcher.reset()
-            undo = nil
+            if automatic, trackManualReversal(key: key, modifiers: modifiers, typed: letter, at: time) {
+                typedLetters = 0
+                return false
+            }
+            if letter == " ", key == UInt16(kVK_Space) {
+                preserveUndoThroughSpace()
+            } else {
+                undo = nil
+            }
+        } else {
+            retyping = nil
         }
         guard action == nil, automatic, let letter else {
             typedLetters = 0
@@ -280,16 +297,18 @@ final class InputEngine {
             return false
         }
         let minimum = LayoutRecognizer.minimumLiveLength
-        typedLetters = min(typedLetters + 1, minimum)
-        guard typedLetters == minimum, let app = eligibleApplication() else { return false }
+        typedLetters = letter == " " ? 0 : min(typedLetters + 1, minimum)
+        guard completedWord || typedLetters == minimum, let app = eligibleApplication() else { return false }
         let revision = inputRevision
         DispatchQueue.main.async { [weak self] in
-            self?.checkTypedLetter(letter, in: app, revision: revision, retries: 4)
+            self?.checkTypedLetter(letter, in: app, revision: revision,
+                                   remainingDelays: AccessibilityRetryPolicy.textPublication.delays[...])
         }
         return false
     }
 
     func noteApplicationActivation(_ app: NSRunningApplication?) {
+        reset()
         contextClick = nil
         ai.panelAppearance.setTextContext(false)
         guard let app, app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
@@ -489,20 +508,100 @@ final class InputEngine {
         )
     }
 
+    private func preserveUndoThroughSpace() {
+        guard let undo, undo.automatic, undo.edit.trailing.count < 3 else {
+            undo = nil
+            return
+        }
+        guard let app = eligibleApplication(), app.processIdentifier == undo.pid,
+              let field = FocusedText(application: app), CFEqual(field.element, undo.element),
+              undo.edit.reverseRange(in: field.value, selection: field.selection) != nil else {
+            self.undo = nil
+            return
+        }
+        let edit = TextEdit(range: undo.edit.range, original: undo.edit.original,
+                            replacement: undo.edit.replacement, trailing: undo.edit.trailing + " ")
+        self.undo = (undo.element, undo.pid, edit, undo.from, undo.toID, undo.automatic)
+    }
+
+    // Observe a manual replacement in the same field and at the same caret position.
+    private func trackManualReversal(key: UInt16, modifiers: UInt64, typed: Character?, at time: Double) -> Bool {
+        let deleting = key == UInt16(kVK_Delete) && modifiers == 0
+        if retyping == nil, deleting, let undo, undo.automatic,
+           let app = eligibleApplication(), app.processIdentifier == undo.pid,
+           let field = FocusedText(application: app), CFEqual(field.element, undo.element),
+           undo.edit.reverseRange(in: field.value, selection: field.selection) != nil {
+            retyping = (undo.element, undo.pid, undo.edit, time, false)
+            self.undo = nil
+            return true
+        }
+        guard var pending = retyping else { return false }
+        guard time - pending.started <= 12, let app = eligibleApplication(), app.processIdentifier == pending.pid,
+              let field = FocusedText(application: app), CFEqual(field.element, pending.element),
+              field.selection.length == 0, field.selection.location >= pending.edit.range.location else {
+            retyping = nil
+            return false
+        }
+        let start = pending.edit.range.location
+        let range = NSRange(location: start, length: field.selection.location - start)
+        guard range.length <= max(pending.edit.original.utf16.count,
+                                  pending.edit.replacement.utf16.count + pending.edit.trailing.utf16.count),
+              let span = Editing.span(range, in: field.value) else {
+            retyping = nil
+            return false
+        }
+        let fragment = String(field.value[span])
+        if key == UInt16(kVK_Space),
+           modifiers == CGEventFlags.maskControl.rawValue || modifiers == CGEventFlags.maskCommand.rawValue {
+            return true
+        }
+        if deleting, !pending.beganTyping, !fragment.isEmpty,
+           (pending.edit.replacement + pending.edit.trailing).hasPrefix(fragment) {
+            return true
+        }
+        let original = pending.edit.original
+        let endsWord = typed == " " || key == UInt16(kVK_Return) || key == UInt16(kVK_Tab)
+            || (typed == nil && modifiers == 0 && Self.wordBoundaryKeys.contains(key))
+        if pending.beganTyping, endsWord, fragment.lowercased() == original.lowercased() {
+            retyping = nil
+            recordReversal(of: original)
+            return true
+        }
+        if let typed, (pending.beganTyping || fragment.isEmpty),
+           original.lowercased().hasPrefix((fragment + String(typed)).lowercased()) {
+            pending.beganTyping = true
+            retyping = pending
+            return true
+        }
+        retyping = nil
+        return false
+    }
+
+    private static let wordBoundaryKeys: Set<UInt16> = [
+        UInt16(kVK_ANSI_Period), UInt16(kVK_ANSI_Comma), UInt16(kVK_ANSI_Semicolon),
+        UInt16(kVK_ANSI_Slash)
+    ]
+
+    private func recordReversal(of original: String) {
+        if let added = wordExceptions.recordReversal(of: original) {
+            ai.showLayoutException(added)
+        }
+    }
+
     private func checkTypedLetter(_ letter: Character, in app: NSRunningApplication,
-                                  revision: UInt64, retries: Int) {
+                                  revision: UInt64, remainingDelays: ArraySlice<Int>) {
         let pid = app.processIdentifier
         guard inputRevision == revision, automatic, !recording,
-              eligibleApplication()?.processIdentifier == pid,
-              let field = FocusedText(application: app) else { return }
-        if field.selection.length == 0,
+              eligibleApplication()?.processIdentifier == pid else { return }
+        if let field = FocusedText(application: app), field.selection.length == 0,
            let caret = Editing.span(field.selection, in: field.value)?.lowerBound,
            caret > field.value.startIndex, field.value[field.value.index(before: caret)] == letter {
             let native = app.bundleIdentifier == "com.apple.TextEdit" || field.supportsNativeReplacement
             _ = correct(in: field, pid: pid, lastTyped: letter, native: native, through: nil)
-        } else if retries > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(15)) { [weak self] in
-                self?.checkTypedLetter(letter, in: app, revision: revision, retries: retries - 1)
+        } else if let delay = remainingDelays.first {
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+                self?.checkTypedLetter(letter, in: app, revision: revision,
+                                       remainingDelays: remainingDelays.dropFirst())
             }
         } else {
             inputLog.notice("Editor did not publish the typed letter at the caret")
@@ -511,15 +610,16 @@ final class InputEngine {
 
     private func correct(in field: FocusedText, pid: pid_t, lastTyped: Character?, native: Bool,
                          through proxy: CGEventTapProxy?) -> Bool {
-        undo = nil
         let automatic = lastTyped != nil
+        if !automatic { undo = nil }
         let selection = field.selection
-        let range: NSRange
+        var range: NSRange
         if selection.length > 0 {
             guard !automatic else { return false }
             range = selection
         } else if automatic {
-            guard let word = Editing.wordWhileTyping(before: selection.location, in: field.value) else { return false }
+            let end = selection.location - (lastTyped == " " ? 1 : 0)
+            guard let word = Editing.wordWhileTyping(before: end, in: field.value) else { return false }
             range = word
         } else {
             guard let caret = Editing.span(selection, in: field.value)?.lowerBound,
@@ -530,13 +630,26 @@ final class InputEngine {
 
         guard range.length <= (automatic ? 40 : 10_000),
               let span = Editing.span(range, in: field.value) else { return false }
-        let original = String(field.value[span])
+        var original = String(field.value[span])
         let oldSource = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
         if automatic, oldSource.flatMap(Self.layout) != Layout.of(original) { return false }
         let replacement: String?
         if let lastTyped {
-            guard !wordExceptions.contains(original) else { return false }
-            replacement = recognizer.correctionWhileTyping(original, lastTyped: lastTyped)
+            guard !wordExceptions.contains(original),
+                  !wordExceptions.matchesEnding(at: NSMaxRange(range), in: field.value) else { return false }
+            let boundary = lastTyped == " "
+            let single = boundary ? recognizer.correctionAtWordBoundary(for: original)
+                : recognizer.correctionWhileTyping(original, lastTyped: lastTyped)
+            if boundary || single != nil,
+               let (phraseRange, converted) = recognizer.phraseCorrection(endingAt: range, in: field.value,
+                                                                         exceptions: wordExceptions) {
+                range = phraseRange
+                guard let phrase = Editing.span(range, in: field.value) else { return false }
+                original = String(field.value[phrase])
+                replacement = converted
+            } else {
+                replacement = single
+            }
         } else {
             replacement = Layout.convert(original)
         }
@@ -578,20 +691,25 @@ final class InputEngine {
             }
             return field.replace(selected, with: replacement + trailing, through: proxy, completion: finish)
         }
+        if !native, !(replacement + trailing).contains(where: \.isNewline),
+           automatic || field.usesComposerLineFeed {
+            replaceLayoutInComposer(field, range: selected, text: replacement + trailing, completion: finish)
+            return true
+        }
         if !automatic { return apply() }
         guard field.beginSelection(selected) else { return false }
         if field.confirmsSelection(selected) { return apply() }
 
         cancelSelection = { field.restoreSelection(after: selected) }
         // Web editors may acknowledge the selection before exposing it to Accessibility.
-        @MainActor func awaitSelection(_ tries: Int) {
+        @MainActor func awaitSelection(_ remainingDelays: ArraySlice<Int>) {
             guard inputRevision == revision else { return }
             if field.confirmsSelection(selected) {
                 cancelSelection = nil
                 if !apply() { field.restoreSelection(after: selected) }
-            } else if tries > 0 {
-                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(8)) {
-                    awaitSelection(tries - 1)
+            } else if let delay = remainingDelays.first {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) {
+                    awaitSelection(remainingDelays.dropFirst())
                 }
             } else {
                 cancelSelection?()
@@ -599,7 +717,10 @@ final class InputEngine {
                 inputLog.notice("Editor did not publish the requested selection")
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(8)) { awaitSelection(3) }
+        let delays = AccessibilityRetryPolicy.selectionPublication.delays[...]
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delays.first ?? 0)) {
+            awaitSelection(delays.dropFirst())
+        }
         return true
     }
 
@@ -611,7 +732,7 @@ final class InputEngine {
         let caret = range.location + undo.edit.original.utf16.count + undo.edit.trailing.utf16.count
         let finish: (Bool) -> Void = { [weak self] applied in
             guard applied else { return }
-            if undo.automatic { self?.wordExceptions.recordReversal(of: undo.edit.original) }
+            if undo.automatic { self?.recordReversal(of: undo.edit.original) }
             if let from = undo.from, let toID = undo.toID,
                let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
                Self.sourceID(current) == toID {
@@ -623,7 +744,25 @@ final class InputEngine {
             return applied
         }
         let selected = NSRange(location: range.location, length: range.length + undo.edit.trailing.utf16.count)
-        return field.replace(selected, with: undo.edit.original + undo.edit.trailing, through: proxy, completion: finish)
+        let original = undo.edit.original + undo.edit.trailing
+        if !native, !original.contains(where: \.isNewline), undo.automatic || field.usesComposerLineFeed {
+            replaceLayoutInComposer(field, range: selected, text: original, completion: finish)
+            return true
+        }
+        return field.replace(selected, with: original, through: proxy, completion: finish)
+    }
+
+    private func replaceLayoutInComposer(_ field: FocusedText, range: NSRange, text: String,
+                                         completion: @escaping (Bool) -> Void) {
+        let revision = inputRevision
+        cancelSelection = { field.restoreSelection(after: range) }
+        field.replaceLayout(range, with: text, isCurrent: { [weak self] in
+            self?.inputRevision == revision
+        }) { [weak self] applied in
+            guard let self, self.inputRevision == revision else { return }
+            self.cancelSelection = nil
+            completion(applied)
+        }
     }
 
     private static func sourceID(_ source: TISInputSource) -> String? {
