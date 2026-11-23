@@ -42,7 +42,7 @@ struct TypoMenuPanel: View {
                 HStack(spacing: 9) {
                     Image(systemName: "keyboard").foregroundStyle(palette.accent).frame(width: 17)
                         .accessibilityHidden(true)
-                    Text("Автоисправление")
+                    Text("Автосмена раскладки")
                 }
             }
             .toggleStyle(MenuSwitchStyle(ink: palette.ink))
