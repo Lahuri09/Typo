@@ -289,9 +289,13 @@ final class LocalAI {
             }
         }
         let fallback = preset.removingFiller(from: source)
-        if revision == nil, fallback != original, accepts(fallback) { return fallback }
+        if revision == nil, let resolved = EditFallback.resolve(original: original, prepared: fallback,
+                                                                 preset: preset) { return resolved }
         if unchanged { throw Failure.noChanges }
-        throw backendError ?? Failure.invalidEdit
+        if let backendError { throw backendError }
+        // A local model can return an unsafe rewrite even after the guarded retry. Do not surface
+        // that as a broken request: keep the selected text intact and report that there were no safe changes.
+        throw Failure.noChanges
     }
 
     private static func correctSpelling(_ text: String, preservingProfanity: Bool) -> String {
