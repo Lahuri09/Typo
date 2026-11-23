@@ -4,7 +4,7 @@ import TypoCore
 
 enum ActivityStatus: Equatable {
     case preparing, recording, transcribing, choosingEdit, refiningEdit, rewriting, ready, inserted, dictated, copied, unchanged
-    case fieldUnavailable, selectionRequired, error(String)
+    case fieldUnavailable, selectionRequired, layoutException(String), error(String)
 
     var label: String {
         switch self {
@@ -21,6 +21,7 @@ enum ActivityStatus: Equatable {
         case .unchanged: "Текст без изменений"
         case .fieldUnavailable: "Выберите текстовое поле"
         case .selectionRequired: "Выделите текст для обработки"
+        case .layoutException(let text): "«\(text)» добавлено в исключения"
         case .error(let message): message
         }
     }
@@ -31,7 +32,7 @@ enum ActivityStatus: Equatable {
         case .transcribing: "waveform"
         case .choosingEdit, .rewriting: FloatingControlPanel.editIcon
         case .refiningEdit: "arrow.clockwise"
-        case .ready, .inserted, .dictated, .copied, .unchanged: "checkmark"
+        case .ready, .inserted, .dictated, .copied, .unchanged, .layoutException: "checkmark"
         case .fieldUnavailable, .selectionRequired: "text.cursor"
         case .error: "exclamationmark"
         }
@@ -42,6 +43,7 @@ enum ActivityStatus: Equatable {
         case .ready: .seconds(6)
         case .inserted, .dictated, .copied, .unchanged: .milliseconds(1800)
         case .fieldUnavailable, .selectionRequired: .milliseconds(2800)
+        case .layoutException: .seconds(3)
         case .error: .seconds(4)
         default: nil
         }
