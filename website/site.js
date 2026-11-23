@@ -71,19 +71,35 @@ function playback(render, onState) {
   return {
     stop,
     get running() { return running; },
-    play(length, interval = 1080) {
+    play(length, interval = 1080, loop = false) {
       stop();
       running = true;
       onState(true);
-      function next(index) {
-        render(index);
-        if (index === length - 1) stop();
-        else timeout = setTimeout(() => next(index + 1), typeof interval === "function" ? interval(index) : interval);
+      function next(index, cycle) {
+        render(index, cycle);
+        const last = index === length - 1;
+        if (last && !loop) {
+          stop();
+          return;
+        }
+        const delay = typeof interval === "function" ? interval(index) : interval;
+        timeout = setTimeout(() => next(last ? 0 : index + 1, last ? cycle + 1 : cycle), delay);
       }
-      next(0);
+      next(0, 0);
     },
   };
 }
+
+const editSamples = [
+  ["Оля привет, я уже закончил отчёт. Завтра скину его тебе на почту, чтобы ты могла его посмотреть.",
+   "Оля, привет! Я уже закончил отчёт. Завтра скину его тебе на почту, чтобы ты могла его посмотреть."],
+  ["Оля, привет! Я закончил отчёт. Завтра вышлю отчёт тебе на почту, чтобы ты смогла ознакомиться с отчётом.",
+   "Оля, привет! Завтра пришлю готовый отчёт на почту."],
+  ["Оля, привет! С отчётом всё готово, завтра скину его тебе на почту.",
+   "Ольга, добрый день! Отчёт готов. Отправлю его вам по электронной почте завтра."],
+  ["Ольга, уведомляю о завершении подготовки отчёта. Документ будет направлен вам завтра.",
+   "Оля, привет! Отчёт готов. Завтра пришлю его тебе."],
+];
 
 const examples = {
   voice: {
@@ -103,10 +119,11 @@ const examples = {
     description: "Исправляйте ошибки, сокращайте текст или меняйте его тон. Результат появится прямо в документе.",
     context: "Заметка",
     frames: [
-      { text: "Слон был бальшой но совсем не страшный.", action: "idle", hold: 1250 },
-      { text: "Слон был бальшой но совсем не страшный.", action: "select", hold: 1350 },
-      { text: "Слон был бальшой но совсем не страшный.", action: "proofread", partial: true, hold: 770 },
-      { text: "Слон был большой, но совсем не страшный.", action: "done" },
+      { action: "idle", hold: 1250 },
+      { action: "select", hold: 1200 },
+      { action: "aim", hold: 760 },
+      { action: "press", hold: 520 },
+      { action: "done" },
     ],
   },
   layout: {
@@ -138,14 +155,25 @@ const exampleKey = document.getElementById("example-key");
 
 let mode = "voice";
 let currentFrame = 0;
+let currentCycle = 0;
+let exampleVisible = false;
+let autoplay = true;
+const editChoices = [...document.querySelectorAll("#example-choices [data-choice]")];
 let exampleStarted = false;
 let artEntrance;
 
-function renderExample(index) {
+function renderExample(index, cycle = currentCycle) {
   const frame = examples[mode].frames[index];
   currentFrame = index;
-  exampleContent.dataset.action = frame.action || "";
-  if (exampleText.textContent !== (frame.text || "")) exampleText.textContent = frame.text || "";
+  currentCycle = cycle;
+  exampleContent.dataset.action = frame.action;
+  let text = frame.text ?? "";
+  if (mode === "edit") {
+    const choice = cycle % editSamples.length;
+    text = editSamples[choice][frame.action === "done" ? 1 : 0];
+    editChoices.forEach((card, index) => card.classList.toggle("is-target", index === choice));
+  }
+  if (exampleText.textContent !== text) exampleText.textContent = text;
   exampleTime.textContent = frame.time || "";
   exampleKey.hidden = !frame.key;
   exampleKey.textContent = frame.key || "";
@@ -169,9 +197,9 @@ const examplePlayer = playback(renderExample, updateExampleControl);
 
 function playExample() {
   const frames = examples[mode].frames;
-  if (reducedMotion.matches) return;
+  if (reducedMotion.matches || !exampleVisible || !autoplay || document.hidden) return;
   exampleStarted = true;
-  examplePlayer.play(frames.length, (index) => frames[index].hold);
+  examplePlayer.play(frames.length, (index) => frames[index].hold ?? 2650, true);
 }
 
 function selectExample(selected) {
@@ -183,23 +211,26 @@ function selectExample(selected) {
   exampleTitle.textContent = example.title;
   exampleDescription.textContent = example.description;
   exampleContext.textContent = example.context || "";
-  renderExample(0);
+  renderExample(0, 0);
   updateExampleControl();
 }
 
 selectExample(mode);
 
-const exampleObserver = new IntersectionObserver((entries) => {
-  if (entries.some((entry) => entry.intersectionRatio >= .3)) {
-    exampleObserver.disconnect();
-    playExample();
-  }
+const exampleObserver = new IntersectionObserver(([entry]) => {
+  exampleVisible = entry.intersectionRatio >= .3;
+  if (exampleVisible) playExample();
+  else examplePlayer.stop();
 }, { threshold: .3 });
 exampleObserver.observe(examplePanel);
 
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) examplePlayer.stop();
+  else playExample();
+});
+
 bindTabs(exampleTabs, examplePanel, (tab) => {
   if (tab.dataset.example === mode) return;
-  exampleObserver.disconnect();
   selectExample(tab.dataset.example);
   artEntrance?.cancel();
   if (!reducedMotion.matches) {
@@ -212,14 +243,15 @@ bindTabs(exampleTabs, examplePanel, (tab) => {
 });
 
 runExample.addEventListener("click", () => {
-  exampleObserver.disconnect();
   if (reducedMotion.matches) {
     const next = nextReducedFrame();
-    renderExample(next === -1 ? 0 : next);
+    renderExample(next === -1 ? 0 : next, currentCycle + (next === -1 ? 1 : 0));
     updateExampleControl();
   } else if (examplePlayer.running) {
+    autoplay = false;
     examplePlayer.stop();
   } else {
+    autoplay = true;
     playExample();
   }
 });
@@ -227,6 +259,7 @@ runExample.addEventListener("click", () => {
 reducedMotion.addEventListener("change", () => {
   artEntrance?.cancel();
   examplePlayer.stop();
+  playExample();
 });
 
 const installMethods = document.getElementById("install-methods");

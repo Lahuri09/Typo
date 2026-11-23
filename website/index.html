@@ -13,8 +13,8 @@
   <meta property="og:description" content="Голосовой ввод, редактура и автоисправление раскладки в одной утилите для macOS.">
   <meta property="og:image" content="assets/screens/menu.png">
   <link rel="icon" href="assets/icon.png" type="image/png">
-  <link rel="stylesheet" href="styles.css">
-  <script src="site.js" defer></script>
+  <link rel="stylesheet" href="styles.css?v=loops">
+  <script src="site.js?v=loops" defer></script>
 </head>
 <body>
   <a class="skip" href="#main">К содержанию</a>
@@ -92,7 +92,13 @@
                     <span id="example-time">2:00</span>
                     <span class="demo-hud-icon demo-confirm">↑</span>
                   </div>
-                  <img class="demo-edit-tools" src="assets/screens/chooser.png" width="964" height="584" alt="Панель Typo AI для выбора стиля редактуры">
+                  <div class="demo-edit-tools" id="example-choices" aria-hidden="true">
+                    <span class="demo-edit-title">Выберите стиль</span>
+                    <div data-choice="0"><strong>Вычитка</strong><small>Ошибки, грамматика и пунктуация</small></div>
+                    <div data-choice="1"><strong>Сократить</strong><small>Без повторов и лишних слов</small></div>
+                    <div data-choice="2"><strong>Деловой тон</strong><small>Ясно и профессионально</small></div>
+                    <div data-choice="3"><strong>Разговорный тон</strong><small>Проще и естественнее</small></div>
+                  </div>
                 </div>
                 <button class="demo-control" id="example-run" type="button" hidden>Смотреть пример</button>
               </div>
