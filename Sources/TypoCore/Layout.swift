@@ -69,6 +69,67 @@ public struct LayoutRecognizer {
         correction(for: word, attested: false)
     }
 
+    public func correctionAtWordBoundary(for word: String) -> String? {
+        guard let source = Layout.of(word) else { return nil }
+        let target = source.converted(word).lowercased()
+        let frequent = lexicon?.supportsShortLiveCorrection(to: target, in: source.opposite) == true
+        return correction(for: word, attested: frequent)
+    }
+
+    private static let russianShort: Set<String> = [
+        "а", "в", "да", "до", "за", "и", "из", "к", "мы", "на", "не", "но", "ну", "о",
+        "об", "он", "от", "по", "с", "ты", "у", "то", "уж", "вы", "я", "же", "бы"
+    ]
+    private static let englishShort: Set<String> = [
+        "a", "am", "an", "as", "at", "be", "by", "do", "go", "he", "i", "if", "in",
+        "is", "it", "me", "my", "no", "of", "oh", "on", "or", "so", "to", "up", "us", "we"
+    ]
+
+    // Use only adjacent words on the same line, with positive evidence for every converted word.
+    public func phraseCorrection(endingAt wordRange: NSRange, in text: String,
+                                 exceptions: WordExceptions) -> (NSRange, String)? {
+        guard let span = Editing.span(wordRange, in: text),
+              let source = Layout.of(String(text[span])) else { return nil }
+        var start = span.lowerBound
+        var best: (NSRange, String)?
+        for wordCount in 1...4 {
+            let phrase = String(text[start..<span.upperBound])
+            let words = phrase.split(separator: " ")
+            guard words.count == wordCount, !exceptions.contains(phrase),
+                  words.allSatisfy({ !exceptions.contains(String($0)) && supportsPhraseWord($0, from: source) })
+            else { break }
+
+            let enoughEvidence = wordCount >= 3
+                || (wordCount == 2 && words.reduce(0, { $0 + $1.count }) >= 4)
+            if enoughEvidence {
+                best = (NSRange(start..<span.upperBound, in: text), source.converted(phrase))
+            }
+            var previousEnd = start
+            while previousEnd > text.startIndex, text[text.index(before: previousEnd)] == " " {
+                previousEnd = text.index(before: previousEnd)
+            }
+            guard previousEnd < start,
+                  let previous = Editing.word(before: text[..<previousEnd].utf16.count, in: text, skipSpaces: false),
+                  let previousSpan = Editing.span(previous, in: text) else { break }
+            start = previousSpan.lowerBound
+        }
+        return best
+    }
+
+    private func supportsPhraseWord(_ word: Substring, from source: Layout) -> Bool {
+        guard (1...40).contains(word.count), word.allSatisfy(\.isLetter),
+              word.allSatisfy({ Layout.of(String($0)) == source }) else { return false }
+        let original = word.lowercased()
+        let target = source.converted(original)
+        let originalShort = source == .russian ? Self.russianShort : Self.englishShort
+        let targetShort = source == .english ? Self.russianShort : Self.englishShort
+        guard target.allSatisfy(\.isLetter), !originalShort.contains(original),
+              lexicon?.contains(original, in: source) != true,
+              word.count < 3 || !isKnown(original, source) else { return false }
+        return targetShort.contains(target)
+            || lexicon?.supportsShortLiveCorrection(to: target, in: source.opposite) == true
+    }
+
     private func correction(for word: String, attested: Bool) -> String? {
         guard (3...40).contains(word.count), let source = Layout.of(word),
               word.allSatisfy({ !$0.isLetter || Layout.of(String($0)) == source })
