@@ -45,6 +45,7 @@ struct TestRunner {
         recognizesWhileTyping()
         recognizesAfterPunctuation()
         learnsWordExceptions()
+        recognizesPhrasesFromContext()
         let header = Data([82, 73, 70, 70, 0, 0, 0, 0, 87, 65, 86, 69, 102, 109, 116, 32,
                            16, 0, 0, 0, 1, 0, 1, 0, 128, 62, 0, 0, 0, 125, 0, 0, 2, 0, 16, 0,
                            100, 97, 116, 97, 0, 0, 0, 0])
@@ -148,6 +149,22 @@ struct TestRunner {
         expect(AIRequest.cleanTranscript("Привет [BLANK_AUDIO] мир!") == "Привет мир!")
         expect(AIRequest.cleanTranscript("Hello, world!") == "Hello, world!")
         expect(AIRequest.cleanTranscript("Первая часть.\nВторая строка\nи конец.") == "Первая часть. Вторая строка и конец.")
+        expect(AccessibilityRetryPolicy.textPublication.delays.count >= 10)
+        expect(AccessibilityRetryPolicy.textPublication.totalDelay >= .milliseconds(240))
+        expect(AccessibilityRetryPolicy.selectionPublication.totalDelay >= .milliseconds(120))
+        expect(PopoverDismissalPolicy.shouldClose(isGlobalClick: true, isPopoverWindow: false,
+                                                   isStatusItemWindow: false))
+        expect(PopoverDismissalPolicy.shouldClose(isGlobalClick: false, isPopoverWindow: false,
+                                                   isStatusItemWindow: false))
+        expect(!PopoverDismissalPolicy.shouldClose(isGlobalClick: false, isPopoverWindow: true,
+                                                    isStatusItemWindow: false))
+        expect(!PopoverDismissalPolicy.shouldClose(isGlobalClick: false, isPopoverWindow: false,
+                                                    isStatusItemWindow: true))
+        expect(EditFallback.resolve(original: "мы получили письмо но не ответили",
+                                    prepared: "мы получили письмо, но не ответили",
+                                    preset: .proofread) == "мы получили письмо, но не ответили")
+        expect(EditFallback.resolve(original: "Текст уже в порядке.",
+                                    prepared: "Текст уже в порядке.", preset: .proofread) == nil)
         print("Passed \(checked) assertions in 12 scenarios")
     }
 }
@@ -273,6 +290,40 @@ struct TestRunner {
     expect(Editing.wordWhileTyping(before: 6, in: "ghbdtn!") == NSRange(location: 0, length: 6))
     expect(Editing.wordWhileTyping(before: 6, in: "ghbdtnx") == nil)
     expect(Editing.wordWhileTyping(before: 8, in: "a/ghbdtn") == NSRange(location: 0, length: 8))
+}
+
+@MainActor private func recognizesPhrasesFromContext() {
+    let recognizer = LayoutRecognizer(lexicon: .bundled) { _, _ in false }
+    var exceptions = WordExceptions()
+
+    func corrected(_ text: String) -> String? {
+        guard let lastWord = Editing.word(before: text.utf16.count, in: text),
+              let (range, replacement) = recognizer.phraseCorrection(endingAt: lastWord, in: text,
+                                                                   exceptions: exceptions),
+              let span = Editing.span(range, in: text) else { return nil }
+        return text.replacingCharacters(in: span, with: replacement)
+    }
+
+    expect(corrected("🙂 ye  b ye ") == "🙂 ну  и ну ")
+    expect(corrected("rfr ltkf") == "как дела")
+    expect(corrected("ye lf") == "ну да")
+    expect(recognizer.correctionAtWordBoundary(for: "rfr") == "как")
+    expect(recognizer.correctionAtWordBoundary(for: "ye") == nil)
+    expect(corrected("щр тщ щр") == "oh no oh")
+    expect(corrected("ну и ну") == nil)
+    expect(corrected("ye") == nil)
+    expect(corrected("ye b\nye") == nil)
+    expect(corrected("hello rfr") == nil)
+    expect(corrected("ye b someone/ye") == nil)
+    expect(exceptions.recordReversal(of: "ye b ye") == nil)
+    expect(exceptions.recordReversal(of: "YE B YE") == nil)
+    expect(exceptions.recordReversal(of: "ye  b ye") == "ye b ye")
+    expect(exceptions.matchesEnding(at: "🙂 ye b ye".utf16.count, in: "🙂 ye b ye"))
+    expect(corrected("ye b ye") == nil)
+    exceptions.remove("ye b ye")
+    expect(corrected("ye b ye") == "ну и ну")
+    exceptions.add("ye")
+    expect(corrected("ye b ye") == nil)
 }
 
 @MainActor private func learnsWordExceptions() {
