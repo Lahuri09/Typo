@@ -43,7 +43,7 @@ struct FocusedText {
     init?(application: NSRunningApplication) {
         guard let element = Self.editorElement(in: application, diagnostics: true),
               let selection = Self.range(element),
-              let value = Self.editorText(element, preferRange: application.bundleIdentifier == "com.openai.codex"),
+              let value = Self.editorText(element, preferRange: Self.isChatGPT(application.bundleIdentifier)),
               Editing.span(selection, in: value) != nil else { return nil }
         if let selections = Self.read(element, kAXSelectedTextRangesAttribute) as? [Any],
            selections.count > 1 { return nil }
@@ -95,10 +95,6 @@ struct FocusedText {
                     guard let label = Self.read(element, attribute) as? String else { return false }
                     return Editing.isCredentialLabel(label)
                 }) else { return nil }
-        guard Self.writable(element, kAXSelectedTextRangeAttribute) else {
-            if diagnostics { inputLog.notice("Editor does not expose a writable selection range") }
-            return nil
-        }
         return element
     }
 
@@ -119,10 +115,15 @@ struct FocusedText {
 
     var supportsNativeReplacement: Bool {
         // The ChatGPT composer acknowledges AXSelectedText writes without changing its text.
-        bundleIdentifier != "com.openai.codex" && Self.writable(element, kAXSelectedTextAttribute)
+        !usesComposerLineFeed && Self.writable(element, kAXSelectedTextRangeAttribute)
+            && Self.writable(element, kAXSelectedTextAttribute)
     }
 
-    var usesComposerLineFeed: Bool { bundleIdentifier == "com.openai.codex" }
+    var usesComposerLineFeed: Bool { Self.isChatGPT(bundleIdentifier) }
+
+    private static func isChatGPT(_ identifier: String?) -> Bool {
+        identifier == "com.openai.codex" || identifier == "com.openai.chat"
+    }
 
     func sameElement(as other: FocusedText) -> Bool {
         pid == other.pid && CFEqual(element, other.element)
@@ -159,7 +160,7 @@ struct FocusedText {
         let inserted = NSRange(location: range.location, length: text.utf16.count)
         let caret = NSRange(location: NSMaxRange(inserted), length: 0)
 
-        prepareDictationRange(range, graphemes: value[span].count, isCurrent: isCurrent) { prepared in
+        prepareReplacementRange(range, graphemes: value[span].count, isCurrent: isCurrent) { prepared in
             guard prepared, isCurrent(), confirmsSelection(range), !IsSecureEventInputEnabled() else {
                 inputLog.notice("Could not confirm the dictation insertion range")
                 completion(false)
@@ -188,7 +189,23 @@ struct FocusedText {
         }
     }
 
-    private func prepareDictationRange(_ target: NSRange, graphemes: Int, isCurrent: @escaping () -> Bool,
+    func replaceLayout(_ range: NSRange, with text: String, isCurrent: @escaping () -> Bool,
+                       completion: @escaping (Bool) -> Void) {
+        guard !Self.pasteInProgress, let span = Editing.span(range, in: value) else {
+            completion(false)
+            return
+        }
+        // Web editors may interpret a synthetic Unicode key event as its physical Space key.
+        prepareReplacementRange(range, graphemes: value[span].count, isCurrent: isCurrent) { prepared in
+            guard prepared, isCurrent() else { completion(false); return }
+            if !replace(range, with: text, through: nil, completion: completion) {
+                restoreSelection(after: range)
+                completion(false)
+            }
+        }
+    }
+
+    private func prepareReplacementRange(_ target: NSRange, graphemes: Int, isCurrent: @escaping () -> Bool,
                                        completion: @escaping (Bool) -> Void) {
         guard isCurrent(), let observed = unchangedDictationSelection else { completion(false); return }
         if observed == target { completion(true); return }
@@ -338,6 +355,9 @@ struct FocusedText {
 
         down.flags = .maskCommand
         up.flags = .maskCommand
+        for event in [down, up] {
+            event.setIntegerValueField(.eventSourceUserData, value: dictationEventMarker)
+        }
         if let proxy {
             down.tapPostEvent(proxy)
             up.tapPostEvent(proxy)
@@ -348,19 +368,19 @@ struct FocusedText {
         var expected = value
         expected.replaceSubrange(span, with: replacement)
         let editedValue = expected
-        let deadline = DispatchTime.now() + .milliseconds(aiPaste ? 1500 : 80)
+        let deadline = DispatchTime.now() + .milliseconds(aiPaste ? 1500 : (usesComposerLineFeed ? 350 : 80))
         @MainActor func confirmPaste() {
             let focused = NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
                 && !IsSecureEventInputEnabled()
                 && Self.read(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute)
                     .map { CFEqual($0, element) } == true
             let actual = focused ? Self.editorText(element,
-                preferRange: aiPaste && usesComposerLineFeed) : nil
+                preferRange: usesComposerLineFeed) : nil
             let inserted = NSRange(location: range.location, length: replacement.utf16.count)
             let end = NSRange(location: NSMaxRange(inserted), length: 0)
             let confirmed = actual.map { observed in
                 if observed == editedValue { return true }
-                guard aiPaste, DictationDraft.matches(observed, expected: editedValue,
+                guard usesComposerLineFeed, DictationDraft.matches(observed, expected: editedValue,
                     allowsMissingTerminalLineFeed: usesComposerLineFeed && end.location < editedValue.utf16.count)
                 else { return false }
                 let selectionAfterPaste = Self.range(element)
@@ -373,7 +393,7 @@ struct FocusedText {
 
             Self.pasteInProgress = false
             saved.restore(to: pasteboard, ifUnchangedSince: replacementCount)
-            if aiPaste, confirmed {
+            if (aiPaste || usesComposerLineFeed), confirmed {
                 if Self.range(element) == inserted {
                     _ = setSelection(NSRange(location: NSMaxRange(inserted), length: 0))
                 }
